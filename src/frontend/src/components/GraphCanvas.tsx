@@ -34,20 +34,41 @@ const EDGE_COLOR_NUM: Record<RelationshipType, number> = {
 
 // ---------- node factory ----------
 
+type Filament = {
+  line: THREE.Line;
+  pts: THREE.Vector3[];
+  baseAng: number;
+};
+
 type NodeUser = {
   domain: string;
   displayName: string;
   body: THREE.Mesh;
   bodyMat: THREE.ShaderMaterial;
   halo: THREE.Sprite;
+  bulbCore: THREE.Mesh;
   bulbGlow: THREE.Mesh;
   light: THREE.PointLight;
+  tube: THREE.Mesh;
+  tubeMat: THREE.MeshBasicMaterial;
+  eye: THREE.Mesh;
+  eyeGlint: THREE.Mesh;
+  teethGroup: THREE.Group;
+  caudal: THREE.Mesh;
+  pectL: THREE.Mesh;
+  pectR: THREE.Mesh;
+  pelvic: THREE.Mesh;
+  tailStub: THREE.Mesh;
+  filaments: Filament[];
+  filamentGroup: THREE.Group;
+  tipPos: THREE.Vector3;
   bobPhase: number;
   bobFreq: number;
   bobAmp: number;
   spinOffset: number;
   home: THREE.Vector3;
   diameter: number;
+  fishYaw: number;
 };
 
 type EdgeObj = {
@@ -105,6 +126,7 @@ function makeGlowTexture(): THREE.Texture {
 function createAnglerfishNode(
   company: CompanyNode,
   pos: THREE.Vector3,
+  idx: number,
   pal: (typeof ZONE_PALETTES)[ZoneKey],
   glow: number,
 ): THREE.Group {
@@ -113,9 +135,32 @@ function createAnglerfishNode(
 
   const pageCount = company.pageCount ?? 10;
   const diameter = 0.9 + Math.min(1.4, Math.sqrt(Math.max(1, pageCount)) / 7);
+  const D = diameter;
 
-  // body
-  const bodyGeo = new THREE.SphereGeometry(diameter, 42, 32);
+  const fishYaw = (idx * 0.83) % (Math.PI * 2);
+  group.rotation.y = fishYaw;
+
+  // BODY — egg-shaped, tapered toward tail.
+  const bodyGeo = new THREE.SphereGeometry(D, 48, 36);
+  {
+    const p = bodyGeo.attributes.position;
+    for (let i = 0; i < p.count; i++) {
+      let x = p.getX(i);
+      let y = p.getY(i);
+      let z = p.getZ(i);
+      const fwd = x / D;
+      const taper = 1 - Math.max(0, -fwd) * 0.55;
+      y *= taper;
+      z *= taper;
+      if (y < 0 && fwd > 0.1) y += y * 0.25 * fwd;
+      if (y > 0 && fwd > 0.05 && fwd < 0.65)
+        y += Math.sin((fwd * Math.PI) / 0.6) * 0.08 * D;
+      x *= 1.35;
+      p.setXYZ(i, x, y, z);
+    }
+    bodyGeo.computeVertexNormals();
+  }
+
   const bodyMat = new THREE.ShaderMaterial({
     uniforms: {
       uBody: { value: new THREE.Color(pal.body) },
@@ -127,69 +172,228 @@ function createAnglerfishNode(
     vertexShader: `
       varying vec3 vNormal;
       varying vec3 vViewPos;
-      void main() {
+      varying vec3 vObjPos;
+      void main(){
         vNormal = normalize(normalMatrix * normal);
         vec4 mv = modelViewMatrix * vec4(position, 1.0);
         vViewPos = -mv.xyz;
+        vObjPos = position;
         gl_Position = projectionMatrix * mv;
       }`,
     fragmentShader: `
       uniform vec3 uBody; uniform vec3 uRim;
       uniform float uTime; uniform float uGlow; uniform float uSelected;
-      varying vec3 vNormal; varying vec3 vViewPos;
-      void main() {
+      varying vec3 vNormal; varying vec3 vViewPos; varying vec3 vObjPos;
+      float hash(vec2 p){return fract(sin(dot(p, vec2(41.3,289.1)))*43758.5453);}
+      float noise(vec2 p){
+        vec2 i=floor(p), f=fract(p);
+        float a=hash(i), b=hash(i+vec2(1.,0.)), c=hash(i+vec2(0.,1.)), d=hash(i+vec2(1.,1.));
+        vec2 u=f*f*(3.0-2.0*f);
+        return mix(a,b,u.x)+(c-a)*u.y*(1.0-u.x)+(d-b)*u.x*u.y;
+      }
+      void main(){
         vec3 v = normalize(vViewPos);
-        float fres = pow(1.0 - max(dot(vNormal, v), 0.0), 2.0);
-        // Stronger fresnel mix so the rim actually reads in the dark scene
-        vec3 col = mix(uBody, uRim, clamp(fres * 1.15 * uGlow, 0.0, 1.0));
-        // Small top-down cheat light so the body has some base brightness
-        float topLight = max(vNormal.y, 0.0) * 0.25;
-        col += uRim * topLight * 0.4;
-        float n = sin(vNormal.x*6.0 + uTime*0.3) * sin(vNormal.y*5.0) * 0.04;
-        col += n;
-        col += uRim * fres * uSelected * 0.9;
+        float fres = pow(1.0 - max(dot(vNormal, v), 0.0), 2.5);
+        vec3 col = mix(uBody, uRim, fres * 0.55 * uGlow);
+        float sc = noise(vObjPos.xy * 14.0) * noise(vObjPos.yz * 11.0);
+        col += (sc - 0.5) * 0.12;
+        float belly = smoothstep(-0.2, -0.9, vObjPos.y);
+        col += belly * vec3(0.02, 0.04, 0.06);
+        col += uRim * fres * uSelected * 0.7;
         gl_FragColor = vec4(col, 1.0);
       }`,
   });
   const body = new THREE.Mesh(bodyGeo, bodyMat);
   group.add(body);
 
-  // lure arc
-  const lureLen = diameter * 1.25;
+  // MOUTH — dark cavity at head
+  const mouthGeo = new THREE.SphereGeometry(
+    D * 0.58,
+    20,
+    16,
+    0,
+    Math.PI * 0.9,
+    Math.PI * 0.3,
+    Math.PI * 0.5,
+  );
+  const mouthMat = new THREE.MeshBasicMaterial({
+    color: 0x050309,
+    side: THREE.DoubleSide,
+  });
+  const mouth = new THREE.Mesh(mouthGeo, mouthMat);
+  mouth.position.set(D * 1.18, -D * 0.08, 0);
+  mouth.rotation.set(-Math.PI / 2, 0, -0.1);
+  group.add(mouth);
+
+  // TEETH
+  const teethMat = new THREE.MeshBasicMaterial({ color: 0xe8ecf5 });
+  const teethGroup = new THREE.Group();
+  const JAW_R = D * 0.62;
+  const mouthAng = Math.PI * 0.9;
+  const toothCount = 9;
+  for (let i = 0; i < toothCount; i++) {
+    const t = i / (toothCount - 1);
+    const a = (t - 0.5) * mouthAng;
+    const up = new THREE.Mesh(
+      new THREE.ConeGeometry(0.04 * D, 0.22 * D * (1 - Math.abs(t - 0.5) * 0.6), 4),
+      teethMat,
+    );
+    up.position.set(D * 1.3 + Math.cos(a) * 0.02, -D * 0.02, Math.sin(a) * JAW_R * 0.95);
+    up.rotation.x = Math.PI;
+    up.rotation.z = Math.sin(a) * 0.3;
+    teethGroup.add(up);
+    const lo = new THREE.Mesh(
+      new THREE.ConeGeometry(0.035 * D, 0.18 * D * (1 - Math.abs(t - 0.5) * 0.6), 4),
+      teethMat,
+    );
+    lo.position.set(D * 1.26 + Math.cos(a) * 0.02, -D * 0.2, Math.sin(a) * JAW_R * 0.9);
+    lo.rotation.z = Math.sin(a) * 0.3;
+    teethGroup.add(lo);
+  }
+  group.add(teethGroup);
+
+  // Jaw ring
+  const jawRing = new THREE.Mesh(
+    new THREE.TorusGeometry(D * 0.55, 0.03 * D, 6, 24, Math.PI * 0.9),
+    new THREE.MeshBasicMaterial({ color: 0x020308 }),
+  );
+  jawRing.position.set(D * 1.17, -D * 0.1, 0);
+  jawRing.rotation.set(Math.PI / 2, 0, -Math.PI / 2);
+  group.add(jawRing);
+
+  // EYE
+  const eyeSocket = new THREE.Mesh(
+    new THREE.SphereGeometry(D * 0.14, 16, 12),
+    new THREE.MeshBasicMaterial({ color: 0x02040a }),
+  );
+  eyeSocket.position.set(D * 0.85, D * 0.25, D * 0.48);
+  group.add(eyeSocket);
+  const eye = new THREE.Mesh(
+    new THREE.SphereGeometry(D * 0.1, 16, 12),
+    new THREE.ShaderMaterial({
+      uniforms: { uCol: { value: new THREE.Color(pal.lure).multiplyScalar(1.3) } },
+      vertexShader: `varying vec3 vN; varying vec3 vV;
+        void main(){ vN = normalize(normalMatrix*normal); vec4 mv=modelViewMatrix*vec4(position,1.0); vV=-mv.xyz; gl_Position=projectionMatrix*mv; }`,
+      fragmentShader: `uniform vec3 uCol; varying vec3 vN; varying vec3 vV;
+        void main(){ float f = pow(max(dot(normalize(vV), vN),0.0), 2.0); vec3 c = mix(vec3(0.01), uCol, f); gl_FragColor=vec4(c,1.0); }`,
+    }),
+  );
+  eye.position.set(D * 0.88, D * 0.27, D * 0.56);
+  group.add(eye);
+  const eyeGlint = new THREE.Mesh(
+    new THREE.SphereGeometry(D * 0.028, 8, 6),
+    new THREE.MeshBasicMaterial({ color: 0xffffff }),
+  );
+  eyeGlint.position.set(D * 0.93, D * 0.32, D * 0.6);
+  group.add(eyeGlint);
+
+  // DORSAL SPINES
+  const spineMat = new THREE.MeshBasicMaterial({ color: 0x04070f });
+  for (let i = 0; i < 6; i++) {
+    const u = i / 5;
+    const spine = new THREE.Mesh(
+      new THREE.ConeGeometry(0.04 * D, 0.22 * D * (1 - Math.abs(u - 0.5) * 0.8), 4),
+      spineMat,
+    );
+    spine.position.set(
+      D * (0.5 - u * 1.4),
+      D * 0.92 + Math.sin(u * Math.PI) * 0.15 * D,
+      0,
+    );
+    spine.rotation.z = 0;
+    group.add(spine);
+  }
+
+  // PECTORAL FINS
+  const finShape = new THREE.Shape();
+  finShape.moveTo(0, 0);
+  finShape.lineTo(D * 0.9, D * 0.1);
+  finShape.lineTo(D * 0.75, -D * 0.05);
+  finShape.lineTo(D * 0.55, -D * 0.22);
+  finShape.lineTo(D * 0.25, -D * 0.12);
+  finShape.lineTo(0, 0);
+  const finGeo = new THREE.ShapeGeometry(finShape);
+  const finMat = new THREE.MeshBasicMaterial({
+    color: 0x060a18,
+    side: THREE.DoubleSide,
+    transparent: true,
+    opacity: 0.9,
+  });
+  const pectL = new THREE.Mesh(finGeo, finMat);
+  pectL.position.set(D * 0.2, -D * 0.15, D * 0.55);
+  pectL.rotation.y = Math.PI / 2;
+  pectL.rotation.z = -0.3;
+  group.add(pectL);
+  const pectR = pectL.clone();
+  pectR.position.set(D * 0.2, -D * 0.15, -D * 0.55);
+  pectR.rotation.y = -Math.PI / 2;
+  pectR.rotation.z = -0.3;
+  group.add(pectR);
+
+  // PELVIC FIN
+  const pelvicShape = new THREE.Shape();
+  pelvicShape.moveTo(0, 0);
+  pelvicShape.lineTo(D * 0.5, D * 0.05);
+  pelvicShape.lineTo(D * 0.4, -D * 0.15);
+  pelvicShape.lineTo(0, 0);
+  const pelvicGeo = new THREE.ShapeGeometry(pelvicShape);
+  const pelvic = new THREE.Mesh(pelvicGeo, finMat);
+  pelvic.position.set(-D * 0.3, -D * 0.85, 0);
+  pelvic.rotation.x = Math.PI / 2;
+  pelvic.rotation.z = -0.4;
+  group.add(pelvic);
+
+  // TAIL + CAUDAL FAN
+  const tailStub = new THREE.Mesh(
+    new THREE.ConeGeometry(D * 0.25, D * 0.5, 12),
+    bodyMat,
+  );
+  tailStub.position.set(-D * 1.45, 0, 0);
+  tailStub.rotation.z = -Math.PI / 2;
+  group.add(tailStub);
+
+  const caudalShape = new THREE.Shape();
+  caudalShape.moveTo(0, 0);
+  caudalShape.lineTo(-D * 0.7, D * 0.55);
+  caudalShape.lineTo(-D * 0.55, 0);
+  caudalShape.lineTo(-D * 0.7, -D * 0.55);
+  caudalShape.lineTo(0, 0);
+  const caudalGeo = new THREE.ShapeGeometry(caudalShape);
+  const caudal = new THREE.Mesh(caudalGeo, finMat);
+  caudal.position.set(-D * 1.7, 0, 0);
+  group.add(caudal);
+
+  // LURE — curved illicium stalk
+  const lureLen = D * 1.6;
   const arcPts: THREE.Vector3[] = [];
-  const steps = 20;
+  const steps = 24;
   for (let i = 0; i <= steps; i++) {
     const t = i / steps;
-    const a = (Math.PI * 0.5) * t;
-    arcPts.push(
-      new THREE.Vector3(
-        Math.sin(a) * lureLen * 0.55,
-        Math.cos(a) * lureLen + diameter * 0.2,
-        0,
-      ),
-    );
+    const x = D * 0.55 + Math.sin(t * Math.PI * 0.8) * lureLen * 0.55;
+    const y = D * 0.95 + t * lureLen * 0.85 - Math.sin(t * Math.PI) * lureLen * 0.15;
+    arcPts.push(new THREE.Vector3(x, y, 0));
   }
   const curve = new THREE.CatmullRomCurve3(arcPts);
-  const tubeGeo = new THREE.TubeGeometry(curve, 30, 0.035, 6, false);
+  const tubeGeo = new THREE.TubeGeometry(curve, 32, 0.04 * D, 6, false);
   const tubeMat = new THREE.MeshBasicMaterial({
-    color: 0x15243f,
+    color: 0x1a2740,
     transparent: true,
-    opacity: 0.85,
+    opacity: 0.95,
   });
-  group.add(new THREE.Mesh(tubeGeo, tubeMat));
+  const tube = new THREE.Mesh(tubeGeo, tubeMat);
+  group.add(tube);
 
   const tipPos = arcPts[arcPts.length - 1].clone();
 
-  // bulb core + glow halo + point light
   const bulbCore = new THREE.Mesh(
-    new THREE.SphereGeometry(0.09, 16, 12),
+    new THREE.SphereGeometry(0.11 * D, 16, 12),
     new THREE.MeshBasicMaterial({ color: 0xffffff }),
   );
   bulbCore.position.copy(tipPos);
   group.add(bulbCore);
 
   const bulbGlow = new THREE.Mesh(
-    new THREE.SphereGeometry(0.26, 20, 16),
+    new THREE.SphereGeometry(0.3 * D, 20, 16),
     new THREE.ShaderMaterial({
       transparent: true,
       depthWrite: false,
@@ -200,16 +404,16 @@ function createAnglerfishNode(
       },
       vertexShader: `
         varying vec3 vNormal; varying vec3 vView;
-        void main() {
+        void main(){
           vNormal = normalize(normalMatrix * normal);
-          vec4 mv = modelViewMatrix * vec4(position, 1.0);
+          vec4 mv = modelViewMatrix * vec4(position,1.0);
           vView = -mv.xyz;
           gl_Position = projectionMatrix * mv;
         }`,
       fragmentShader: `
         uniform vec3 uColor; uniform float uIntensity;
         varying vec3 vNormal; varying vec3 vView;
-        void main() {
+        void main(){
           float f = pow(1.0 - abs(dot(normalize(vView), vNormal)), 3.0);
           gl_FragColor = vec4(uColor * uIntensity, f);
         }`,
@@ -217,6 +421,43 @@ function createAnglerfishNode(
   );
   bulbGlow.position.copy(tipPos);
   group.add(bulbGlow);
+
+  // Filaments from lure tip
+  const filamentGroup = new THREE.Group();
+  const filMat = new THREE.LineBasicMaterial({
+    color: pal.lure,
+    transparent: true,
+    opacity: 0.75,
+  });
+  const filaments: Filament[] = [];
+  for (let f = 0; f < 4; f++) {
+    const segs = 8;
+    const pts: THREE.Vector3[] = [];
+    const baseAng = (f / 4) * Math.PI * 2;
+    for (let s = 0; s <= segs; s++) {
+      const u = s / segs;
+      const x = Math.cos(baseAng) * u * 0.18 * D;
+      const y = -u * 0.6 * D;
+      const z = Math.sin(baseAng) * u * 0.18 * D;
+      pts.push(new THREE.Vector3(x, y, z));
+    }
+    const lg = new THREE.BufferGeometry().setFromPoints(pts);
+    const line = new THREE.Line(lg, filMat);
+    line.position.copy(tipPos);
+    filamentGroup.add(line);
+    const bead = new THREE.Mesh(
+      new THREE.SphereGeometry(0.03 * D, 8, 6),
+      new THREE.MeshBasicMaterial({
+        color: pal.lure,
+        transparent: true,
+        opacity: 0.9,
+      }),
+    );
+    bead.position.copy(tipPos).add(pts[pts.length - 1]);
+    filamentGroup.add(bead);
+    filaments.push({ line, pts, baseAng });
+  }
+  group.add(filamentGroup);
 
   const halo = new THREE.Sprite(
     new THREE.SpriteMaterial({
@@ -228,31 +469,16 @@ function createAnglerfishNode(
       blending: THREE.AdditiveBlending,
     }),
   );
-  halo.scale.set(1.6, 1.6, 1);
+  halo.scale.set(1.8 * D, 1.8 * D, 1);
   halo.position.copy(tipPos);
   group.add(halo);
 
-  const light = new THREE.PointLight(pal.lure, 0.9 * glow, 6, 2);
+  const light = new THREE.PointLight(pal.lure, 0.9 * glow, 7, 2);
   light.position.copy(tipPos);
   group.add(light);
 
-  // fins
-  const finMat = new THREE.MeshBasicMaterial({
-    color: 0x0a1025,
-    side: THREE.DoubleSide,
-    transparent: true,
-    opacity: 0.85,
-  });
-  for (const sideSign of [-1, 1] as const) {
-    const fin = new THREE.Mesh(
-      new THREE.PlaneGeometry(diameter * 0.8, diameter * 0.5),
-      finMat,
-    );
-    fin.position.set(sideSign * diameter * 0.85, -diameter * 0.1, 0);
-    fin.rotation.z = sideSign * 0.4;
-    fin.rotation.y = sideSign * 0.2;
-    group.add(fin);
-  }
+  // tilt fish slightly so the camera catches the profile nicely
+  group.rotation.x = -0.05;
 
   const userData: NodeUser = {
     domain: company.domain,
@@ -260,14 +486,29 @@ function createAnglerfishNode(
     body,
     bodyMat,
     halo,
+    bulbCore,
     bulbGlow,
     light,
+    tube,
+    tubeMat,
+    eye,
+    eyeGlint,
+    teethGroup,
+    caudal,
+    pectL,
+    pectR,
+    pelvic,
+    tailStub,
+    filaments,
+    filamentGroup,
+    tipPos: tipPos.clone(),
     bobPhase: Math.random() * Math.PI * 2,
     bobFreq: 0.4 + Math.random() * 0.3,
     bobAmp: 0.15 + Math.random() * 0.2,
     spinOffset: Math.random() * 0.4 - 0.2,
     home: pos.clone(),
     diameter,
+    fishYaw,
   };
   group.userData = userData;
   return group;
@@ -515,13 +756,30 @@ export default function GraphCanvas({
       const w = worldRef.current;
       const t = w.clock.getElapsedTime();
 
-      // node bob + lure pulse
+      // node bob + lure pulse + fin/tail/filament animation
       w.nodes.forEach((g) => {
         const u = g.userData as NodeUser;
         g.position.y = u.home.y + Math.sin(t * u.bobFreq + u.bobPhase) * u.bobAmp;
         g.position.x = u.home.x + Math.cos(t * u.bobFreq * 0.7 + u.bobPhase) * u.bobAmp * 0.5;
         g.position.z = u.home.z + Math.sin(t * u.bobFreq * 0.5 + u.bobPhase) * u.bobAmp * 0.3;
-        g.rotation.y = Math.sin(t * 0.3 + u.bobPhase) * 0.15 + u.spinOffset;
+        g.rotation.y = u.fishYaw + Math.sin(t * 0.3 + u.bobPhase) * 0.15 + u.spinOffset;
+        // tail swish
+        u.caudal.rotation.y = Math.sin(t * 2.0 + u.bobPhase) * 0.35;
+        u.tailStub.rotation.x = Math.sin(t * 2.0 + u.bobPhase) * 0.15;
+        // pectoral fin flap
+        u.pectL.rotation.z = -0.3 + Math.sin(t * 1.4 + u.bobPhase) * 0.15;
+        u.pectR.rotation.z = -0.3 + Math.sin(t * 1.4 + u.bobPhase + Math.PI) * 0.15;
+        // filament sway
+        u.filaments.forEach((f, fi) => {
+          const g2 = f.line.geometry.attributes.position as THREE.BufferAttribute;
+          for (let s = 0; s < f.pts.length; s++) {
+            const u2 = s / (f.pts.length - 1);
+            const sway = Math.sin(t * 1.2 + fi + u2 * 3) * 0.08 * u.diameter;
+            g2.setX(s, f.pts[s].x + sway * Math.cos(f.baseAng));
+            g2.setZ(s, f.pts[s].z + sway * Math.sin(f.baseAng));
+          }
+          g2.needsUpdate = true;
+        });
         u.bodyMat.uniforms.uTime.value = t;
         const pulse = 0.8 + 0.35 * Math.sin(t * 1.6 + u.bobPhase * 2);
         (u.bulbGlow.material as THREE.ShaderMaterial).uniforms.uIntensity.value =
@@ -676,7 +934,7 @@ export default function GraphCanvas({
     ordered.forEach((c, i) => {
       if (w.nodes.has(c.domain)) return;
       const pos = randSpherePosition(i, Math.max(totalWanted, 4));
-      const g = createAnglerfishNode(c, pos, pal, w.glow);
+      const g = createAnglerfishNode(c, pos, i, pal, w.glow);
       g.userData = { ...(g.userData as NodeUser), domain: c.domain };
       g.traverse((o) => {
         o.userData.nodeDomain = c.domain;
