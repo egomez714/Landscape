@@ -15,7 +15,7 @@ from typing import AsyncIterator
 
 from app.clients.humandelta import HumanDeltaClient
 from app.models import CompanyCandidate, IndexedCompany
-from app.services import index_cache
+from app.services import index_cache, temporal_store
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +29,8 @@ class IndexStartedEvent:
 @dataclass(frozen=True)
 class IndexCompletedEvent:
     indexed: IndexedCompany
+    crawl_version: int
+    is_fresh: bool  # True if a new crawl happened this run; False on cache hit
 
 
 @dataclass(frozen=True)
@@ -53,14 +55,23 @@ async def _index_one(
         cached = await index_cache.get(hd, company.domain)
         if cached:
             cached_id, cached_pages = cached
+            # Resolve (or lazily backfill) the crawl version so downstream knows what
+            # to attribute edges to. Backfill happens at most once per domain.
+            version = await temporal_store.latest_version_or_backfill(
+                company.domain, cached_id, cached_pages,
+            )
             await queue.put(IndexStartedEvent(company=company, index_id=cached_id))
-            await queue.put(IndexCompletedEvent(indexed=IndexedCompany(
-                name=company.name,
-                url=company.url,
-                domain=company.domain,
-                index_id=cached_id,
-                page_count=cached_pages,
-            )))
+            await queue.put(IndexCompletedEvent(
+                indexed=IndexedCompany(
+                    name=company.name,
+                    url=company.url,
+                    domain=company.domain,
+                    index_id=cached_id,
+                    page_count=cached_pages,
+                ),
+                crawl_version=version,
+                is_fresh=False,
+            ))
             return
 
     try:
@@ -83,14 +94,21 @@ async def _index_one(
     page_count = status.page_count or 0
     if use_cache:
         index_cache.put(company.domain, index_id, page_count)
+    # Every fresh crawl bumps the per-domain version. This is what mark_stale
+    # compares against to decide which edges fell off.
+    version = await temporal_store.record_crawl(company.domain, index_id, page_count)
 
-    await queue.put(IndexCompletedEvent(indexed=IndexedCompany(
-        name=company.name,
-        url=company.url,
-        domain=company.domain,
-        index_id=index_id,
-        page_count=page_count,
-    )))
+    await queue.put(IndexCompletedEvent(
+        indexed=IndexedCompany(
+            name=company.name,
+            url=company.url,
+            domain=company.domain,
+            index_id=index_id,
+            page_count=page_count,
+        ),
+        crawl_version=version,
+        is_fresh=True,
+    ))
 
 
 async def index_all(

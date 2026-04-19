@@ -225,13 +225,32 @@ class HumanDeltaClient:
     ) -> str:
         """Return up to max_bytes of text from the first few .md pages in the VFS.
 
-        Used by GeminiClient.summarize_company to get raw text for a one-sentence summary.
+        Tries `<domain>` and `www.<domain>` since HD may mount at either depending on
+        how the crawl resolved redirects. If both are empty (e.g. a just-completed
+        index whose VFS isn't queryable yet), waits 2s and retries once.
         """
-        vfs = f"/source/website/{source_domain}"
-        cmd = (
-            f"find {vfs} -maxdepth 3 -name '*.md' -print 2>/dev/null "
-            f"| head -n 3 | xargs -I {{}} cat {{}} 2>/dev/null "
-            f"| head -c {max_bytes}"
-        )
-        res = await self.fs(index_id=index_id, cmd=cmd)
-        return (res.get("stdout") or "").strip()
+        candidates = [source_domain]
+        if not source_domain.startswith("www."):
+            candidates.append(f"www.{source_domain}")
+        elif source_domain.startswith("www."):
+            candidates.append(source_domain[4:])
+
+        async def try_once() -> str:
+            for dom in candidates:
+                vfs = f"/source/website/{dom}"
+                cmd = (
+                    f"find {vfs} -maxdepth 3 -name '*.md' -print 2>/dev/null "
+                    f"| head -n 3 | xargs -I {{}} cat {{}} 2>/dev/null "
+                    f"| head -c {max_bytes}"
+                )
+                res = await self.fs(index_id=index_id, cmd=cmd)
+                stdout = (res.get("stdout") or "").strip()
+                if stdout:
+                    return stdout
+            return ""
+
+        content = await try_once()
+        if content:
+            return content
+        await asyncio.sleep(2.0)
+        return await try_once()

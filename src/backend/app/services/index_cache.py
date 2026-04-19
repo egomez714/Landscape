@@ -15,26 +15,32 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from app.config import settings
+
 if TYPE_CHECKING:
     from app.clients.humandelta import HumanDeltaClient
 
 log = logging.getLogger(__name__)
 
-CACHE_PATH = Path(__file__).resolve().parents[2] / ".cache" / "indexes.json"
+
+def _cache_path() -> Path:
+    return settings.cache_dir / "indexes.json"
 
 
 def _load() -> dict[str, dict]:
-    if not CACHE_PATH.exists():
+    p = _cache_path()
+    if not p.exists():
         return {}
     try:
-        return json.loads(CACHE_PATH.read_text())
+        return json.loads(p.read_text())
     except (OSError, json.JSONDecodeError):
         return {}
 
 
 def _save(cache: dict[str, dict]) -> None:
-    CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CACHE_PATH.write_text(json.dumps(cache, indent=2, sort_keys=True))
+    p = _cache_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(cache, indent=2, sort_keys=True))
 
 
 async def get(hd: "HumanDeltaClient", domain: str) -> tuple[str, int] | None:
