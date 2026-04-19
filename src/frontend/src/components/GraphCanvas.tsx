@@ -71,9 +71,11 @@ type EdgeObj = {
 };
 
 function randSpherePosition(i: number, total: number): THREE.Vector3 {
+  // Fibonacci-spiral distribution on a lens-shaped surface.
+  // Base radius scales with sqrt(total) so 20 companies don't crowd like 4 do.
   const phi = Math.acos(1 - (2 * (i + 0.5)) / total);
   const theta = Math.PI * (1 + Math.sqrt(5)) * i;
-  const r = 11 + (i % 3) * 0.6;
+  const r = 8 + Math.sqrt(Math.max(1, total)) * 2.6 + (i % 3) * 0.6;
   return new THREE.Vector3(
     Math.cos(theta) * Math.sin(phi) * r,
     Math.sin(theta) * Math.sin(phi) * r * 0.6,
@@ -403,8 +405,8 @@ export default function GraphCanvas({
       camPitch: 0,
       camYawTarget: 0,
       camPitchTarget: 0,
-      camRadius: 28,
-      camRadiusTarget: 28,
+      camRadius: 34,
+      camRadiusTarget: 34,
       selectedDomain: null,
       animFrame: null,
       clock: new THREE.Clock(),

@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from itertools import combinations
 from typing import AsyncIterator
 
 from app.clients.gemini import GeminiClient
@@ -122,13 +121,17 @@ def _build_evidence_snippets(
 async def extract_graph(
     hd: HumanDeltaClient,
     gemini: GeminiClient,
-    indexed: list[IndexedCompany],
+    pairs: list[tuple[IndexedCompany, IndexedCompany]],
     *,
     concurrency: int = 4,
 ) -> AsyncIterator[ExtractionEvent]:
-    """Extract edges for every unordered pair, concurrently (capped)."""
+    """Extract edges for each given pair concurrently (capped).
+
+    Callers build the pair list so they control scope — e.g. the initial query uses
+    `combinations(indexed, 2)` (all pairs), whereas expansion uses only pairs where
+    at least one side is a newly-added company (see app/routers/expand.py).
+    """
     sem = asyncio.Semaphore(concurrency)
-    pairs = list(combinations(indexed, 2))
 
     async def guarded(a: IndexedCompany, b: IndexedCompany) -> ExtractionEvent:
         async with sem:

@@ -34,6 +34,16 @@ _IMAGE_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Code-block syntax also produces terrible evidence quotes: `from pinecone import Client`
+# tells you nothing about the relationship — it's just a code sample showing usage.
+# Rejected patterns: import/require statements, declaration keywords, heavy-brace lines.
+_CODE_LINE_RE = re.compile(
+    r"^\s*(?:import\s+|from\s+\S+\s+import\s+|require\(|const\s+\w|let\s+\w|var\s+\w"
+    r"|function\s+\w|def\s+\w|class\s+\w|export\s+(?:const|let|function|default|class)"
+    r"|#include|package\s+\w|\$\s+npm\s|pip\s+install\s)",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class IndexStatus:
@@ -203,6 +213,8 @@ class HumanDeltaClient:
             if text.startswith("![") or text.startswith("http"):
                 continue
             if _IMAGE_URL_RE.search(text):
+                continue
+            if _CODE_LINE_RE.match(text):
                 continue
             text = text[:max_chars_per_line]
             if text in seen_texts:

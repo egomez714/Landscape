@@ -3,11 +3,15 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
 
 import { API_BASE } from "@/lib/graph";
+import { postSSEStream } from "@/lib/sse";
 import type {
   CompaniesParsedEvent,
+  CompanyNode,
+  DiscoveredVia,
   DoneEvent,
   EdgeFoundEvent,
   ErrorEvent,
+  ExpandCandidate,
   GraphState,
   IndexCompletedEvent,
   IndexFailedEvent,
@@ -16,6 +20,12 @@ import type {
 
 type Action =
   | { type: "start"; query: string }
+  | {
+      type: "expand_start";
+      sourceCompany: { name: string; domain: string };
+      candidates: ExpandCandidate[];
+      newCompanyUrls: Record<string, { name: string; url: string; domain: string }>;
+    }
   | { type: "companies_parsed"; payload: CompaniesParsedEvent }
   | { type: "index_started"; payload: IndexStartedEvent }
   | { type: "index_completed"; payload: IndexCompletedEvent }
@@ -33,6 +43,7 @@ const initial: GraphState = {
   selectedDomain: null,
   error: null,
   totals: null,
+  discoveredVia: {},
 };
 
 function reducer(state: GraphState, action: Action): GraphState {
@@ -46,6 +57,38 @@ function reducer(state: GraphState, action: Action): GraphState {
         companies[c.domain] = { ...c, status: "pending" };
       }
       return { ...state, phase: "indexing", companies };
+    }
+
+    case "expand_start": {
+      // Merge new candidates into the existing graph state as pending nodes.
+      // Existing companies + edges stay intact; only new domains are added.
+      const newCompanies: Record<string, CompanyNode> = { ...state.companies };
+      const newDV: Record<string, DiscoveredVia> = { ...state.discoveredVia };
+      for (const c of action.candidates) {
+        const urlInfo = action.newCompanyUrls[c.name];
+        if (!urlInfo) continue; // no homepage url available → can't index
+        if (newCompanies[urlInfo.domain]) continue; // already in graph
+        newCompanies[urlInfo.domain] = {
+          name: urlInfo.name,
+          url: urlInfo.url,
+          domain: urlInfo.domain,
+          status: "pending",
+        };
+        newDV[urlInfo.domain] = {
+          source_name: action.sourceCompany.name,
+          source_domain: action.sourceCompany.domain,
+          evidence_quote: c.evidence_quote,
+          source_url: c.source_url,
+        };
+      }
+      return {
+        ...state,
+        phase: "indexing",
+        companies: newCompanies,
+        discoveredVia: newDV,
+        error: null,
+        totals: null,
+      };
     }
 
     case "index_started": {
@@ -117,10 +160,19 @@ function reducer(state: GraphState, action: Action): GraphState {
 export function useQueryStream() {
   const [state, dispatch] = useReducer(reducer, initial);
   const sourceRef = useRef<EventSource | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  // The reducer needs the latest companies to build `existing_indexed` for expand.
+  // Closure over state would stale here since runExpand is memoized; use a ref.
+  const stateRef = useRef(state);
+  stateRef.current = state;
 
   const close = useCallback(() => {
     sourceRef.current?.close();
     sourceRef.current = null;
+    if (abortRef.current) {
+      abortRef.current.abort();
+      abortRef.current = null;
+    }
   }, []);
 
   const run = useCallback(
@@ -154,8 +206,6 @@ export function useQueryStream() {
         close();
       });
       src.addEventListener("error", (e) => {
-        // SSE "error" arrives as a MessageEvent only if the server emits event: error.
-        // Connection errors arrive as plain Events with no data.
         const me = e as MessageEvent;
         if (typeof me.data === "string") {
           handler<ErrorEvent>("error")(me);
@@ -171,11 +221,84 @@ export function useQueryStream() {
     [close],
   );
 
+  const runExpand = useCallback(
+    async (
+      sourceCompany: { name: string; domain: string },
+      candidates: ExpandCandidate[],
+      resolved: Record<string, { name: string; url: string; domain: string }>,
+    ) => {
+      close();
+
+      // Preliminary state update — pending nodes + discoveredVia.
+      dispatch({
+        type: "expand_start",
+        sourceCompany,
+        candidates,
+        newCompanyUrls: resolved,
+      });
+
+      const existing = Object.values(stateRef.current.companies)
+        .filter((c) => c.status === "completed" && c.indexId)
+        .map((c) => ({
+          name: c.name,
+          url: c.url,
+          domain: c.domain,
+          index_id: c.indexId!,
+          page_count: c.pageCount ?? 0,
+        }));
+      const newDomains = Object.values(resolved);
+      if (newDomains.length === 0) return;
+
+      const ctrl = new AbortController();
+      abortRef.current = ctrl;
+      try {
+        for await (const frame of postSSEStream(
+          `${API_BASE}/v1/expand/stream`,
+          {
+            context: {
+              source_name: sourceCompany.name,
+              source_domain: sourceCompany.domain,
+            },
+            existing_indexed: existing,
+            new_candidates: newDomains,
+          },
+          ctrl.signal,
+        )) {
+          if (frame.event === "expansion_context") continue;
+          if (frame.event === "index_started") {
+            dispatch({ type: "index_started", payload: frame.data as IndexStartedEvent });
+          } else if (frame.event === "index_completed") {
+            dispatch({ type: "index_completed", payload: frame.data as IndexCompletedEvent });
+          } else if (frame.event === "index_failed") {
+            dispatch({ type: "index_failed", payload: frame.data as IndexFailedEvent });
+          } else if (frame.event === "edge_found") {
+            dispatch({ type: "edge_found", payload: frame.data as EdgeFoundEvent });
+          } else if (frame.event === "done") {
+            dispatch({ type: "done", payload: frame.data as DoneEvent });
+          } else if (frame.event === "error") {
+            dispatch({ type: "error", payload: frame.data as ErrorEvent });
+          }
+        }
+      } catch (err) {
+        if ((err as Error).name !== "AbortError") {
+          console.error("expand stream error", err);
+          dispatch({
+            type: "error",
+            payload: { stage: "expand", message: String(err) },
+          });
+        }
+      } finally {
+        if (abortRef.current === ctrl) abortRef.current = null;
+      }
+    },
+    [close],
+  );
+
   const select = useCallback((domain: string | null) => {
     dispatch({ type: "select", domain });
   }, []);
 
   useEffect(() => close, [close]);
 
-  return { state, run, select };
+  return { state, run, runExpand, select };
 }

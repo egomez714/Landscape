@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.routers import company as company_router
 from app.routers import crawl_history as crawl_history_router
+from app.routers import expand as expand_router
 from app.routers import query as query_router
 from app.services import db
 
@@ -32,6 +33,7 @@ app.add_middleware(
 app.include_router(query_router.router)
 app.include_router(company_router.router)
 app.include_router(crawl_history_router.router)
+app.include_router(expand_router.router)
 
 
 @app.get("/health")

@@ -3,13 +3,15 @@
 import { useEffect, useRef, useState } from "react";
 
 import { API_BASE, EDGE_COLOR, EDGE_LABEL } from "@/lib/graph";
-import type { CompanyNode, GraphEdge } from "@/lib/types";
+import type { CompanyNode, DiscoveredVia, GraphEdge } from "@/lib/types";
 
 type Props = {
   selected: CompanyNode | null;
   edges: GraphEdge[];
   companies: Record<string, CompanyNode>;
+  discoveredVia: Record<string, DiscoveredVia>;
   onSelect: (domain: string | null) => void;
+  onExpandFromNode: (() => void) | null; // null when expansion isn't available
 };
 
 type SummaryState = "idle" | "loading" | "loaded" | "error";
@@ -18,7 +20,9 @@ export default function SidePanel({
   selected,
   edges,
   companies,
+  discoveredVia,
   onSelect,
+  onExpandFromNode,
 }: Props) {
   const [summaries, setSummaries] = useState<Record<string, string>>({});
   const [summaryState, setSummaryState] = useState<Record<string, SummaryState>>({});
@@ -95,7 +99,9 @@ export default function SidePanel({
           selected={selected}
           edges={edges}
           companies={companies}
+          discoveredVia={discoveredVia[selected.domain]}
           onSelect={onSelect}
+          onExpandFromNode={onExpandFromNode}
           summary={summaries[selected.domain]}
           summaryState={summaryState[selected.domain] ?? "idle"}
         />}
@@ -140,17 +146,25 @@ function PanelBody({
   selected,
   edges,
   companies,
+  discoveredVia,
   onSelect,
+  onExpandFromNode,
   summary,
   summaryState,
 }: {
   selected: CompanyNode;
   edges: GraphEdge[];
   companies: Record<string, CompanyNode>;
+  discoveredVia: DiscoveredVia | undefined;
   onSelect: (domain: string | null) => void;
+  onExpandFromNode: (() => void) | null;
   summary: string | undefined;
   summaryState: SummaryState;
 }) {
+  const sourceNodeDomain = discoveredVia
+    ? Object.values(companies).find((c) => c.name === discoveredVia.source_name)
+        ?.domain ?? discoveredVia.source_domain
+    : null;
   const connected = connectedEdges(selected, edges);
   const statusLabel = {
     pending: "queued",
@@ -167,6 +181,34 @@ function PanelBody({
 
   return (
     <>
+      {discoveredVia && (
+        <div className="mb-[14px] rounded-[10px] border border-[rgba(0,229,255,0.18)] bg-[rgba(0,229,255,0.04)] px-3 py-[10px]">
+          <div className="mb-[4px] font-mono text-[9px] uppercase tracking-[0.22em] text-[var(--cyan-soft)]">
+            Discovered via
+          </div>
+          <div className="text-[12.5px] leading-[1.5] text-[var(--fg)]">
+            <button
+              type="button"
+              onClick={() => sourceNodeDomain && onSelect(sourceNodeDomain)}
+              className="font-[var(--font-display)] text-[14px] text-[var(--cyan-soft)] underline underline-offset-2 hover:text-[var(--fg)]"
+            >
+              {discoveredVia.source_name}
+            </button>
+          </div>
+          <div className="mt-1 text-[11.5px] italic leading-[1.5] text-[#b9cce8]">
+            “{discoveredVia.evidence_quote}”
+          </div>
+          <a
+            href={discoveredVia.source_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="mt-1 inline-block font-mono text-[9.5px] tracking-[0.12em] text-[var(--cyan-soft)] opacity-85 hover:opacity-100 hover:underline"
+          >
+            src ↗
+          </a>
+        </div>
+      )}
+
       <div className="flex flex-col gap-[6px]">
         <div className="text-[22px] leading-[1.1] font-normal font-[var(--font-display)] text-[var(--fg)]">
           {selected.name}
@@ -215,6 +257,17 @@ function PanelBody({
               </span>
             )}
           </div>
+        )}
+
+        {/* find-more-like-this */}
+        {onExpandFromNode && selected.status === "completed" && (
+          <button
+            type="button"
+            onClick={onExpandFromNode}
+            className="mt-3 self-start rounded-[10px] border border-[rgba(0,229,255,0.35)] bg-[linear-gradient(180deg,rgba(0,229,255,0.12),rgba(0,229,255,0.03))] px-3 py-[6px] font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--cyan-soft)] shadow-[0_0_14px_rgba(0,229,255,0.1)] hover:bg-[linear-gradient(180deg,rgba(0,229,255,0.22),rgba(0,229,255,0.08))]"
+          >
+            ⌖ Find more like this
+          </button>
         )}
       </div>
 

@@ -38,6 +38,22 @@ export type GraphEdge = {
   evidence: EvidenceSnippet[];
 };
 
+// ---- Feature 2: expansion ----
+
+export type ExpandCandidate = {
+  name: string;
+  evidence_quote: string;
+  source_url: string;
+  homepage_url: string | null;
+};
+
+export type DiscoveredVia = {
+  source_name: string;      // name of the node the user clicked "Find more like this" on
+  source_domain: string;
+  evidence_quote: string;   // the candidate's own evidence, not the source's
+  source_url: string;       // the page URL that evidence came from
+};
+
 // ---- SSE event wire shapes ----
 
 export type CompaniesParsedEvent = { companies: CompanyRef[] };
@@ -66,4 +82,5 @@ export type GraphState = {
   selectedDomain: string | null;
   error: ErrorEvent | null;
   totals: { companies: number; edges: number } | null;
+  discoveredVia: Record<string, DiscoveredVia>; // keyed by new-node's domain
 };

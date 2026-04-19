@@ -1,7 +1,8 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 
+import ExpandModal from "@/components/ExpandModal";
 import GraphCanvas from "@/components/GraphCanvas";
 import HudCorners from "@/components/HudCorners";
 import Legend from "@/components/Legend";
@@ -12,7 +13,8 @@ import TelemetryChips from "@/components/TelemetryChips";
 import { useQueryStream } from "@/hooks/useQueryStream";
 
 export default function Home() {
-  const { state, run, select } = useQueryStream();
+  const { state, run, runExpand, select } = useQueryStream();
+  const [expandOpen, setExpandOpen] = useState(false);
 
   const selected = useMemo(
     () => (state.selectedDomain ? state.companies[state.selectedDomain] : null),
@@ -31,6 +33,12 @@ export default function Home() {
   ).length;
   const emptyEcosystem =
     state.phase === "done" && linkCount === 0 && indexedCount >= 2;
+
+  // Expansion available only when: selected node is indexed + not busy.
+  const onExpandFromNode =
+    selected && selected.status === "completed" && selected.indexId && !isBusy
+      ? () => setExpandOpen(true)
+      : null;
 
   return (
     <main
@@ -117,7 +125,9 @@ export default function Home() {
           selected={selected ?? null}
           edges={state.edges}
           companies={state.companies}
+          discoveredVia={state.discoveredVia}
           onSelect={select}
+          onExpandFromNode={onExpandFromNode}
         />
       </section>
 
@@ -134,6 +144,22 @@ export default function Home() {
         />
         <Legend />
       </footer>
+
+      {expandOpen && selected && selected.indexId && (
+        <ExpandModal
+          sourceNode={selected}
+          existingCompanyNames={Object.values(state.companies).map((c) => c.name)}
+          onClose={() => setExpandOpen(false)}
+          onAdd={(accepted, resolved) => {
+            setExpandOpen(false);
+            runExpand(
+              { name: selected.name, domain: selected.domain },
+              accepted,
+              resolved,
+            );
+          }}
+        />
+      )}
     </main>
   );
 }
