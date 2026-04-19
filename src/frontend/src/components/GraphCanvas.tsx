@@ -2,11 +2,8 @@
 
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
-import { Line2 } from "three/examples/jsm/lines/Line2.js";
-import { LineGeometry } from "three/examples/jsm/lines/LineGeometry.js";
-import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
 
-import { EDGE_COLOR_HEX, ZONE_PALETTES } from "@/lib/graph";
+import { ZONE_PALETTES } from "@/lib/graph";
 import type {
   CompanyNode,
   GraphEdge as GraphEdgeT,
@@ -22,13 +19,13 @@ type Props = {
 
 type ZoneKey = keyof typeof ZONE_PALETTES;
 
-// Numeric versions of edge colors for three.js (hex ints).
+// Numeric versions of edge colors for three.js (hex ints). Mirrors EDGE_COLOR
+// in lib/graph.ts — keep in sync.
 const EDGE_COLOR_NUM: Record<RelationshipType, number> = {
   partner: 0x00e5ff,
   competitor: 0xff8c64,
-  investor: 0xb19cff,
-  downstream: 0x5dcaa5,
-  talent: 0xf0c978,
+  uses: 0x5dcaa5,
+  customer: 0xb19cff,
   none: 0x394b6a,
 };
 
@@ -77,19 +74,18 @@ type EdgeObj = {
   b: THREE.Group;
   aDomain: string;
   bDomain: string;
-  line: Line2;
-  lineGeom: LineGeometry;
-  lineMat: LineMaterial;
-  segPositions: Float32Array;
-  particles: THREE.Points;
-  pPos: Float32Array;
-  pCount: number;
+  ribbon: THREE.Mesh;
+  ribbonGeom: THREE.BufferGeometry;
+  ribbonMat: THREE.ShaderMaterial;
+  ribbonVerts: Float32Array;
   conf: number;
   color: number;
   phase: number;
   curveOffset: number;
   curve?: THREE.QuadraticBezierCurve3;
 };
+
+const EDGE_SEGS = 30;
 
 function randSpherePosition(i: number, total: number): THREE.Vector3 {
   // Fibonacci-spiral distribution on a lens-shaped surface.
@@ -193,8 +189,8 @@ function createAnglerfishNode(
       }
       void main(){
         vec3 v = normalize(vViewPos);
-        float fres = pow(1.0 - max(dot(vNormal, v), 0.0), 2.5);
-        vec3 col = mix(uBody, uRim, fres * 0.55 * uGlow);
+        float fres = pow(1.0 - max(dot(vNormal, v), 0.0), 2.2);
+        vec3 col = mix(uBody, uRim, clamp(fres * 0.85 * uGlow, 0.0, 1.0));
         float sc = noise(vObjPos.xy * 14.0) * noise(vObjPos.yz * 11.0);
         col += (sc - 0.5) * 0.12;
         float belly = smoothstep(-0.2, -0.9, vObjPos.y);
@@ -469,11 +465,11 @@ function createAnglerfishNode(
       blending: THREE.AdditiveBlending,
     }),
   );
-  halo.scale.set(1.8 * D, 1.8 * D, 1);
+  halo.scale.set(2.2 * D, 2.2 * D, 1);
   halo.position.copy(tipPos);
   group.add(halo);
 
-  const light = new THREE.PointLight(pal.lure, 0.9 * glow, 7, 2);
+  const light = new THREE.PointLight(pal.lure, 1.4 * glow, 10, 2);
   light.position.copy(tipPos);
   group.add(light);
 
@@ -551,6 +547,7 @@ export default function GraphCanvas({
     camPitchTarget: number;
     camRadius: number;
     camRadiusTarget: number;
+    nextSpiralIndex: number;
     selectedDomain: string | null;
     animFrame: number | null;
     clock: THREE.Clock;
@@ -560,7 +557,7 @@ export default function GraphCanvas({
   // ---- init (run once) ----
   useEffect(() => {
     if (!canvasRef.current || !hostRef.current) return;
-    const pal = ZONE_PALETTES.abyss;
+    const pal = ZONE_PALETTES.sunlit;
     const renderer = new THREE.WebGLRenderer({
       canvas: canvasRef.current,
       antialias: true,
@@ -648,10 +645,11 @@ export default function GraphCanvas({
       camPitchTarget: 0,
       camRadius: 34,
       camRadiusTarget: 34,
+      nextSpiralIndex: 0,
       selectedDomain: null,
       animFrame: null,
       clock: new THREE.Clock(),
-      glow: 1.0,
+      glow: 2.1,
     };
 
     // resize
@@ -662,10 +660,6 @@ export default function GraphCanvas({
       worldRef.current.renderer.setSize(w, h, false);
       worldRef.current.camera.aspect = w / h;
       worldRef.current.camera.updateProjectionMatrix();
-      // Line2 materials need the canvas resolution to compute screen-space width.
-      worldRef.current.edgeObjs.forEach((eo) => {
-        eo.lineMat.resolution.set(w, h);
-      });
     };
     resize();
     window.addEventListener("resize", resize);
@@ -781,51 +775,71 @@ export default function GraphCanvas({
           g2.needsUpdate = true;
         });
         u.bodyMat.uniforms.uTime.value = t;
-        const pulse = 0.8 + 0.35 * Math.sin(t * 1.6 + u.bobPhase * 2);
+        const pulse = 0.85 + 0.35 * Math.sin(t * 1.6 + u.bobPhase * 2);
         (u.bulbGlow.material as THREE.ShaderMaterial).uniforms.uIntensity.value =
-          pulse * w.glow;
-        (u.halo.material as THREE.SpriteMaterial).opacity =
-          (0.45 + 0.35 * pulse) * w.glow;
-        u.light.intensity = pulse * 0.9 * w.glow;
+          pulse * w.glow * 1.4;
+        (u.halo.material as THREE.SpriteMaterial).opacity = Math.min(
+          1,
+          (0.55 + 0.35 * pulse) * w.glow,
+        );
+        u.light.intensity = pulse * 1.4 * w.glow;
       });
 
-      // edges (geometry + particle flow)
+      // edges (ribbon geometry + flowing-gradient shader + midpoint plaque)
       const sel = w.selectedDomain;
+      const up = new THREE.Vector3(0, 0, 1);
       w.edgeObjs.forEach((eo) => {
+        // Skip degenerate edges: self-loops (both endpoints map to the same
+        // domain — happens when entity resolution collides, e.g. "AWS" and
+        // "AWS AI Services" both resolving to aws.amazon.com) or edges whose
+        // endpoints have collapsed onto the same position. Either case makes
+        // the perp/side vectors zero-length and poisons the ribbon geometry
+        // with NaN, which three.js surfaces as a noisy computeBoundingSphere
+        // warning every frame.
+        if (eo.aDomain === eo.bDomain) return;
         const a = eo.a.position;
         const b = eo.b.position;
+        if (a.distanceToSquared(b) < 1e-6) return;
+
         const mid = new THREE.Vector3().addVectors(a, b).multiplyScalar(0.5);
         const dir = new THREE.Vector3().subVectors(b, a);
-        const perp = new THREE.Vector3(-dir.y, dir.x, 0).normalize();
+        const perpRaw = new THREE.Vector3(-dir.y, dir.x, 0);
+        const perp = perpRaw.lengthSq() > 1e-8
+          ? perpRaw.normalize()
+          : new THREE.Vector3(1, 0, 0);
         mid.add(perp.multiplyScalar(eo.curveOffset * 0.5));
         mid.z += 1.2 + eo.curveOffset * 0.3;
         const curve = new THREE.QuadraticBezierCurve3(a.clone(), mid, b.clone());
         eo.curve = curve;
 
-        for (let i = 0; i <= 24; i++) {
-          const p = curve.getPoint(i / 24);
-          eo.segPositions[3 * i] = p.x;
-          eo.segPositions[3 * i + 1] = p.y;
-          eo.segPositions[3 * i + 2] = p.z;
+        const ribbonWidth = 0.22 + eo.conf * 0.22;
+        const rv = eo.ribbonVerts;
+        for (let i = 0; i <= EDGE_SEGS; i++) {
+          const tt = i / EDGE_SEGS;
+          const p = curve.getPoint(tt);
+          const tan = curve.getTangent(tt);
+          const sideRaw = new THREE.Vector3().crossVectors(tan, up);
+          const side = sideRaw.lengthSq() > 1e-8
+            ? sideRaw.normalize()
+            : new THREE.Vector3(1, 0, 0);
+          // Flare the tape toward the midpoint so ends taper to a point.
+          const ww = ribbonWidth * Math.sin(tt * Math.PI);
+          rv[i * 6 + 0] = p.x + side.x * ww;
+          rv[i * 6 + 1] = p.y + side.y * ww;
+          rv[i * 6 + 2] = p.z + side.z * ww;
+          rv[i * 6 + 3] = p.x - side.x * ww;
+          rv[i * 6 + 4] = p.y - side.y * ww;
+          rv[i * 6 + 5] = p.z - side.z * ww;
         }
-        eo.lineGeom.setPositions(eo.segPositions);
-        eo.line.computeLineDistances();
-
-        for (let i = 0; i < eo.pCount; i++) {
-          const frac = (t * 0.25 + i / eo.pCount + eo.phase) % 1;
-          const p = curve.getPoint(frac);
-          eo.pPos[3 * i] = p.x;
-          eo.pPos[3 * i + 1] = p.y;
-          eo.pPos[3 * i + 2] = p.z;
-        }
-        eo.particles.geometry.attributes.position.needsUpdate = true;
+        eo.ribbonGeom.attributes.position.needsUpdate = true;
+        eo.ribbonGeom.computeBoundingSphere();
 
         const isSel =
           sel !== null && (eo.aDomain === sel || eo.bDomain === sel);
-        const base = 0.55 + eo.conf * 0.35;
-        eo.lineMat.opacity = base * (isSel ? 1.6 : 1) * (sel && !isSel ? 0.4 : 1);
-        (eo.particles.material as THREE.PointsMaterial).opacity =
-          isSel ? 1 : sel ? 0.45 : 1;
+        const dim = sel && !isSel ? 0.3 : 1;
+        eo.ribbonMat.uniforms.uTime.value = t + eo.phase;
+        eo.ribbonMat.uniforms.uSelected.value = isSel ? 1 : 0;
+        eo.ribbonMat.opacity = dim; // actual alpha is driven by the shader
       });
 
       // marine snow drift
@@ -903,7 +917,7 @@ export default function GraphCanvas({
   useEffect(() => {
     const w = worldRef.current;
     if (!w || !labelLayerRef.current) return;
-    const pal = ZONE_PALETTES.abyss;
+    const pal = ZONE_PALETTES.sunlit;
     const wantedDomains = new Set(Object.keys(companies));
     const totalWanted = wantedDomains.size;
 
@@ -927,14 +941,20 @@ export default function GraphCanvas({
       }
     }
 
-    // add new in a deterministic order so positions are stable
+    // Place new nodes on a stable Fibonacci spiral using a monotonically-increasing
+    // counter that persists across expansions. Existing nodes never move (their
+    // userData.home is set once at insertion). Using a fixed VIRTUAL_TOTAL instead
+    // of the current count prevents new nodes from colliding with old ones — each
+    // new node just takes the next slot on a large, sparse spiral.
+    const VIRTUAL_TOTAL = 24;
     const ordered = Object.values(companies).sort((a, b) =>
       a.domain.localeCompare(b.domain),
     );
-    ordered.forEach((c, i) => {
+    ordered.forEach((c) => {
       if (w.nodes.has(c.domain)) return;
-      const pos = randSpherePosition(i, Math.max(totalWanted, 4));
-      const g = createAnglerfishNode(c, pos, i, pal, w.glow);
+      const spiralIdx = w.nextSpiralIndex++;
+      const pos = randSpherePosition(spiralIdx, VIRTUAL_TOTAL);
+      const g = createAnglerfishNode(c, pos, spiralIdx, pal, w.glow);
       g.userData = { ...(g.userData as NodeUser), domain: c.domain };
       g.traverse((o) => {
         o.userData.nodeDomain = c.domain;
@@ -976,12 +996,9 @@ export default function GraphCanvas({
 
     // tear down old
     w.edgeObjs.forEach((eo) => {
-      w.edgesGroup.remove(eo.line);
-      w.edgesGroup.remove(eo.particles);
-      eo.lineGeom.dispose();
-      eo.lineMat.dispose();
-      eo.particles.geometry.dispose();
-      (eo.particles.material as THREE.Material).dispose();
+      w.edgesGroup.remove(eo.ribbon);
+      eo.ribbonGeom.dispose();
+      eo.ribbonMat.dispose();
     });
     w.edgeObjs = [];
 
@@ -989,9 +1006,6 @@ export default function GraphCanvas({
     // translate SSE edges (which use display names) back to the node keys (domains).
     const nameToDomain = new Map<string, string>();
     Object.values(companies).forEach((c) => nameToDomain.set(c.name, c.domain));
-
-    const canvasW = w.renderer.domElement.clientWidth;
-    const canvasH = w.renderer.domElement.clientHeight;
 
     edges.forEach((edge) => {
       const aDomain = nameToDomain.get(edge.source);
@@ -1002,47 +1016,69 @@ export default function GraphCanvas({
       if (!a || !b) return;
 
       const color = EDGE_COLOR_NUM[edge.type];
+      const color3 = new THREE.Color(color);
       const conf =
         edge.confidence === "high" ? 1 : edge.confidence === "medium" ? 0.65 : 0.38;
 
-      // Thick screen-space line. `linewidth` is pixels when worldUnits=false.
-      // Base was effectively 1px; 5× → 5px for high, scaled down for lower confidence.
-      const segCount = 24;
-      const segPositions = new Float32Array((segCount + 1) * 3);
-      const lineGeom = new LineGeometry();
-      lineGeom.setPositions(segPositions);
-      const lineMat = new LineMaterial({
-        color,
-        linewidth: 2.5 + conf * 2.5,
-        transparent: true,
-        opacity: 0.55 + conf * 0.35,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-        worldUnits: false,
-        dashed: false,
-      });
-      lineMat.resolution.set(canvasW, canvasH);
-      const line = new Line2(lineGeom, lineMat);
-      line.computeLineDistances();
-      w.edgesGroup.add(line);
-
-      const pCount = Math.round(10 + conf * 16);
-      const pGeom = new THREE.BufferGeometry();
-      const pPos = new Float32Array(pCount * 3);
-      pGeom.setAttribute("position", new THREE.BufferAttribute(pPos, 3));
-      const particles = new THREE.Points(
-        pGeom,
-        new THREE.PointsMaterial({
-          color,
-          size: 0.32,
-          transparent: true,
-          opacity: 1,
-          depthWrite: false,
-          blending: THREE.AdditiveBlending,
-          map: makeGlowTexture(),
-        }),
+      // Flat ribbon: (EDGE_SEGS+1) pairs of verts, one above/below the curve.
+      const ribbonGeom = new THREE.BufferGeometry();
+      const ribbonVerts = new Float32Array((EDGE_SEGS + 1) * 2 * 3);
+      const ribbonUV = new Float32Array((EDGE_SEGS + 1) * 2 * 2);
+      const ribbonIdx: number[] = [];
+      for (let i = 0; i < EDGE_SEGS; i++) {
+        const a0 = i * 2;
+        const b0 = i * 2 + 1;
+        const a1 = (i + 1) * 2;
+        const b1 = (i + 1) * 2 + 1;
+        ribbonIdx.push(a0, b0, b1, a0, b1, a1);
+      }
+      for (let i = 0; i <= EDGE_SEGS; i++) {
+        const u = i / EDGE_SEGS;
+        ribbonUV[i * 4 + 0] = u;
+        ribbonUV[i * 4 + 1] = 0;
+        ribbonUV[i * 4 + 2] = u;
+        ribbonUV[i * 4 + 3] = 1;
+      }
+      ribbonGeom.setAttribute(
+        "position",
+        new THREE.BufferAttribute(ribbonVerts, 3),
       );
-      w.edgesGroup.add(particles);
+      ribbonGeom.setAttribute("uv", new THREE.BufferAttribute(ribbonUV, 2));
+      ribbonGeom.setIndex(ribbonIdx);
+
+      const ribbonMat = new THREE.ShaderMaterial({
+        transparent: true,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        blending: THREE.AdditiveBlending,
+        uniforms: {
+          uColor: { value: color3.clone() },
+          uTime: { value: 0 },
+          uConf: { value: conf },
+          uSelected: { value: 0 },
+        },
+        vertexShader: `
+          varying vec2 vUV;
+          void main(){
+            vUV = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          }`,
+        fragmentShader: `
+          uniform vec3 uColor; uniform float uTime; uniform float uConf; uniform float uSelected;
+          varying vec2 vUV;
+          void main(){
+            float edge = smoothstep(0.0, 0.4, vUV.y) * smoothstep(1.0, 0.6, vUV.y);
+            float flow = sin((vUV.x - uTime*0.15)*18.0)*0.5 + 0.5;
+            flow = pow(flow, 2.5);
+            float taper = smoothstep(0.0, 0.12, vUV.x) * smoothstep(1.0, 0.88, vUV.x);
+            float a = edge * taper * (0.18 + 0.55 * flow * (0.35 + uConf*0.65));
+            a *= (1.0 + uSelected * 1.4);
+            vec3 c = uColor * (0.7 + 0.6 * flow);
+            gl_FragColor = vec4(c, a);
+          }`,
+      });
+      const ribbon = new THREE.Mesh(ribbonGeom, ribbonMat);
+      w.edgesGroup.add(ribbon);
 
       w.edgeObjs.push({
         edge,
@@ -1050,13 +1086,10 @@ export default function GraphCanvas({
         b,
         aDomain,
         bDomain,
-        line,
-        lineGeom,
-        lineMat,
-        segPositions,
-        particles,
-        pPos,
-        pCount,
+        ribbon,
+        ribbonGeom,
+        ribbonMat,
+        ribbonVerts,
         conf,
         color,
         phase: Math.random() * 10,
@@ -1083,11 +1116,6 @@ export default function GraphCanvas({
     <div ref={hostRef} className="relative h-full w-full overflow-hidden rounded-[18px] border border-[rgba(140,200,255,0.08)] bg-[radial-gradient(ellipse_120%_80%_at_50%_0%,_#061228_0%,_#020615_60%,_#000105_100%)]">
       <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" />
       <div ref={labelLayerRef} className="pointer-events-none absolute inset-0" />
-      {/* crosshair */}
-      <div className="pointer-events-none absolute left-1/2 top-1/2 h-[26px] w-[26px] -translate-x-1/2 -translate-y-1/2 rounded-full border border-[rgba(0,229,255,0.18)]">
-        <span className="absolute left-1/2 -top-[6px] -bottom-[6px] w-[1px] -translate-x-1/2 bg-[rgba(0,229,255,0.18)]" />
-        <span className="absolute top-1/2 -left-[6px] -right-[6px] h-[1px] -translate-y-1/2 bg-[rgba(0,229,255,0.18)]" />
-      </div>
     </div>
   );
 }

@@ -4,9 +4,8 @@ import type { RelationshipType } from "@/lib/types";
 const TYPES: RelationshipType[] = [
   "partner",
   "competitor",
-  "investor",
-  "downstream",
-  "talent",
+  "uses",
+  "customer",
 ];
 
 export default function Legend() {

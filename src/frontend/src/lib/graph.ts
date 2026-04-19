@@ -1,12 +1,14 @@
 import type { RelationshipType } from "./types";
 
 // Bioluminescent palette from the design — used for edge colors and the Legend.
+// Four edge types (partner/competitor/uses/customer) earn their place — each
+// answers a distinct user question and extracts reliably from public websites.
+// Investor + talent were dropped: near-zero extraction rate in practice.
 export const EDGE_COLOR: Record<RelationshipType, string> = {
   partner: "#00e5ff",
   competitor: "#ff8c64",
-  investor: "#b19cff",
-  downstream: "#5dcaa5",
-  talent: "#f0c978",
+  uses: "#5dcaa5",
+  customer: "#b19cff",
   none: "#394b6a",
 };
 // Alias used by the GraphCanvas/SidePanel as the CSS hex source of truth.
@@ -15,9 +17,8 @@ export const EDGE_COLOR_HEX = EDGE_COLOR;
 export const EDGE_LABEL: Record<RelationshipType, string> = {
   partner: "Partner",
   competitor: "Competitor",
-  investor: "Investor",
-  downstream: "Downstream",
-  talent: "Talent",
+  uses: "Uses",
+  customer: "Customer",
   none: "None",
 };
 

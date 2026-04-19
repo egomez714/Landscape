@@ -3,9 +3,8 @@
 export type RelationshipType =
   | "competitor"
   | "partner"
-  | "investor"
-  | "downstream"
-  | "talent"
+  | "uses"
+  | "customer"
   | "none";
 
 export type Confidence = "high" | "medium" | "low";
@@ -45,6 +44,9 @@ export type ExpandCandidate = {
   evidence_quote: string;
   source_url: string;
   homepage_url: string | null;
+  // Set when the candidate's homepage domain matches a node already in the
+  // graph — the modal disables the checkbox and shows "already in graph as X".
+  collides_with: string | null;
 };
 
 export type DiscoveredVia = {

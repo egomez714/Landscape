@@ -2,12 +2,12 @@
 
 import { useEffect, useRef, useState } from "react";
 
-import { fetchExpansionCandidates } from "@/lib/expand";
+import { fetchExpansionCandidates, type ExistingNodeRef } from "@/lib/expand";
 import type { CompanyNode, ExpandCandidate } from "@/lib/types";
 
 type Props = {
   sourceNode: CompanyNode;
-  existingCompanyNames: string[];
+  existingNodes: ExistingNodeRef[];
   onClose: () => void;
   onAdd: (
     accepted: ExpandCandidate[],
@@ -32,7 +32,7 @@ function urlToDomain(url: string): string | null {
 
 export default function ExpandModal({
   sourceNode,
-  existingCompanyNames,
+  existingNodes,
   onClose,
   onAdd,
 }: Props) {
@@ -55,7 +55,7 @@ export default function ExpandModal({
         const cands = await fetchExpansionCandidates(
           sourceNode.domain,
           sourceNode.indexId!,
-          existingCompanyNames,
+          existingNodes,
           ctrl.signal,
         );
         if (ctrl.signal.aborted) return;
@@ -67,9 +67,13 @@ export default function ExpandModal({
         );
         setCandidates(usable);
         setLoadState(usable.length === 0 ? "empty" : "ready");
-        // Default: pre-check every usable candidate.
+        // Default: pre-check every *non-colliding* candidate. Collided ones
+        // would be silently dropped downstream anyway (the reducer dedupes by
+        // domain); pre-checking them would be a promise the UI can't keep.
         const initial: Record<string, boolean> = {};
-        for (const c of usable) initial[c.name] = true;
+        for (const c of usable) {
+          if (!c.collides_with) initial[c.name] = true;
+        }
         setSelected(initial);
       } catch (e) {
         if ((e as Error).name !== "AbortError") {
@@ -82,7 +86,7 @@ export default function ExpandModal({
     return () => {
       ctrl.abort();
     };
-  }, [sourceNode.domain, sourceNode.indexId, existingCompanyNames]);
+  }, [sourceNode.domain, sourceNode.indexId, existingNodes]);
 
   // Esc to close
   useEffect(() => {
@@ -169,18 +173,24 @@ export default function ExpandModal({
             <ul className="flex flex-col gap-2">
               {candidates.map((c) => {
                 const isSelected = !!selected[c.name];
+                const collides = !!c.collides_with;
                 return (
                   <li
                     key={c.name}
-                    className="flex items-start gap-3 rounded-[10px] border border-[rgba(140,200,255,0.1)] bg-[rgba(10,18,40,0.4)] px-3 py-[10px] transition hover:border-[rgba(0,229,255,0.3)]"
+                    className={`flex items-start gap-3 rounded-[10px] border px-3 py-[10px] transition ${
+                      collides
+                        ? "border-[rgba(140,200,255,0.06)] bg-[rgba(10,18,40,0.2)] opacity-55"
+                        : "border-[rgba(140,200,255,0.1)] bg-[rgba(10,18,40,0.4)] hover:border-[rgba(0,229,255,0.3)]"
+                    }`}
                   >
                     <input
                       type="checkbox"
                       checked={isSelected}
+                      disabled={collides}
                       onChange={() =>
                         setSelected((s) => ({ ...s, [c.name]: !s[c.name] }))
                       }
-                      className="mt-[3px] h-4 w-4 shrink-0 accent-[var(--cyan)]"
+                      className="mt-[3px] h-4 w-4 shrink-0 accent-[var(--cyan)] disabled:cursor-not-allowed"
                     />
                     <div className="min-w-0 flex-1">
                       <div className="flex items-baseline gap-2">
@@ -196,6 +206,14 @@ export default function ExpandModal({
                           {c.homepage_url}
                         </a>
                       </div>
+                      {collides && (
+                        <div className="mt-1 font-mono text-[10px] uppercase tracking-[0.14em] text-[var(--fg-faint)]">
+                          already in graph as{" "}
+                          <span className="text-[var(--cyan-soft)]">
+                            {c.collides_with}
+                          </span>
+                        </div>
+                      )}
                       <div className="mt-1 text-[12px] italic leading-[1.5] text-[#b9cce8]">
                         “{c.evidence_quote}”
                       </div>

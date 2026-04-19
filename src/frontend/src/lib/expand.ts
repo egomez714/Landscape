@@ -1,10 +1,12 @@
 import { API_BASE } from "./graph";
 import type { ExpandCandidate } from "./types";
 
+export type ExistingNodeRef = { name: string; domain: string };
+
 export async function fetchExpansionCandidates(
   sourceDomain: string,
   sourceIndexId: string,
-  exclusions: string[],
+  existingNodes: ExistingNodeRef[],
   signal?: AbortSignal,
 ): Promise<ExpandCandidate[]> {
   const res = await fetch(`${API_BASE}/v1/expand_from_node`, {
@@ -13,7 +15,7 @@ export async function fetchExpansionCandidates(
     body: JSON.stringify({
       source_domain: sourceDomain,
       source_index_id: sourceIndexId,
-      exclusions,
+      existing_nodes: existingNodes,
     }),
     signal,
   });
