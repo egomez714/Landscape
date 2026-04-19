@@ -2,6 +2,9 @@
 
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
+import { Line2 } from "three/examples/jsm/lines/Line2.js";
+import { LineGeometry } from "three/examples/jsm/lines/LineGeometry.js";
+import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
 
 import { EDGE_COLOR_HEX, ZONE_PALETTES } from "@/lib/graph";
 import type {
@@ -53,8 +56,10 @@ type EdgeObj = {
   b: THREE.Group;
   aDomain: string;
   bDomain: string;
-  line: THREE.Line;
-  geom: THREE.BufferGeometry;
+  line: Line2;
+  lineGeom: LineGeometry;
+  lineMat: LineMaterial;
+  segPositions: Float32Array;
   particles: THREE.Points;
   pPos: Float32Array;
   pCount: number;
@@ -301,6 +306,8 @@ export default function GraphCanvas({
     camPitch: number;
     camYawTarget: number;
     camPitchTarget: number;
+    camRadius: number;
+    camRadiusTarget: number;
     selectedDomain: string | null;
     animFrame: number | null;
     clock: THREE.Clock;
@@ -396,6 +403,8 @@ export default function GraphCanvas({
       camPitch: 0,
       camYawTarget: 0,
       camPitchTarget: 0,
+      camRadius: 28,
+      camRadiusTarget: 28,
       selectedDomain: null,
       animFrame: null,
       clock: new THREE.Clock(),
@@ -410,43 +419,92 @@ export default function GraphCanvas({
       worldRef.current.renderer.setSize(w, h, false);
       worldRef.current.camera.aspect = w / h;
       worldRef.current.camera.updateProjectionMatrix();
+      // Line2 materials need the canvas resolution to compute screen-space width.
+      worldRef.current.edgeObjs.forEach((eo) => {
+        eo.lineMat.resolution.set(w, h);
+      });
     };
     resize();
     window.addEventListener("resize", resize);
 
-    // mouse parallax
+    // Click-drag to pan the camera; a click without meaningful drag selects a node.
     const host = hostRef.current;
+    host.style.cursor = "grab";
+    let isDragging = false;
+    let lastX = 0;
+    let lastY = 0;
+    let downX = 0;
+    let downY = 0;
+    const DRAG_THRESHOLD_PX = 4;
+
+    const onDown = (e: MouseEvent) => {
+      isDragging = true;
+      lastX = e.clientX;
+      lastY = e.clientY;
+      downX = e.clientX;
+      downY = e.clientY;
+      host.style.cursor = "grabbing";
+    };
     const onMove = (e: MouseEvent) => {
-      if (!worldRef.current || !hostRef.current) return;
-      const r = hostRef.current.getBoundingClientRect();
-      const mx = ((e.clientX - r.left) / r.width) * 2 - 1;
-      const my = -((e.clientY - r.top) / r.height) * 2 + 1;
-      worldRef.current.camYawTarget = mx * 0.25;
-      worldRef.current.camPitchTarget = my * 0.15;
-    };
-    const onLeave = () => {
-      if (!worldRef.current) return;
-      worldRef.current.camYawTarget = 0;
-      worldRef.current.camPitchTarget = 0;
-    };
-    const onClick = (e: MouseEvent) => {
-      if (!worldRef.current || !hostRef.current) return;
+      if (!isDragging || !worldRef.current) return;
+      const dx = e.clientX - lastX;
+      const dy = e.clientY - lastY;
+      lastX = e.clientX;
+      lastY = e.clientY;
+      // Drag-rate: full canvas width ≈ 0.9 radians of yaw (~50°). Y axis inverted so
+      // dragging down tilts the camera down.
       const w = worldRef.current;
-      const r = hostRef.current.getBoundingClientRect();
-      const mx = ((e.clientX - r.left) / r.width) * 2 - 1;
-      const my = -((e.clientY - r.top) / r.height) * 2 + 1;
-      w.raycaster.setFromCamera(new THREE.Vector2(mx, my), w.camera);
-      const hits = w.raycaster.intersectObjects(w.nodeMeshes, true);
-      if (hits.length) {
-        const domain = hits[0].object.userData.nodeDomain as string | undefined;
-        if (domain) onSelectRef.current(domain);
-      } else {
-        onSelectRef.current(null);
+      const rect = host.getBoundingClientRect();
+      w.camYawTarget -= (dx / rect.width) * 1.8;
+      w.camPitchTarget = Math.max(
+        -0.9,
+        Math.min(0.9, w.camPitchTarget - (dy / rect.height) * 1.2),
+      );
+    };
+    const onUp = (e: MouseEvent) => {
+      if (!worldRef.current || !hostRef.current) return;
+      const wasDragging = isDragging;
+      isDragging = false;
+      host.style.cursor = "grab";
+
+      const totalDx = e.clientX - downX;
+      const totalDy = e.clientY - downY;
+      if (Math.hypot(totalDx, totalDy) < DRAG_THRESHOLD_PX && wasDragging) {
+        const w = worldRef.current;
+        const r = hostRef.current.getBoundingClientRect();
+        const mx = ((e.clientX - r.left) / r.width) * 2 - 1;
+        const my = -((e.clientY - r.top) / r.height) * 2 + 1;
+        w.raycaster.setFromCamera(new THREE.Vector2(mx, my), w.camera);
+        const hits = w.raycaster.intersectObjects(w.nodeMeshes, true);
+        if (hits.length) {
+          const domain = hits[0].object.userData.nodeDomain as string | undefined;
+          if (domain) onSelectRef.current(domain);
+        } else {
+          onSelectRef.current(null);
+        }
       }
     };
+    const onLeave = () => {
+      isDragging = false;
+      host.style.cursor = "grab";
+    };
+    // Wheel = trackpad two-finger scroll or pinch zoom (browsers deliver pinches as
+    // wheel events with ctrlKey=true). Treat both as zoom.
+    const onWheel = (e: WheelEvent) => {
+      if (!worldRef.current) return;
+      e.preventDefault();
+      // Pinch deltas are small (<5); scroll deltas can be huge. Normalize both.
+      const scale = 1 + Math.max(-0.15, Math.min(0.15, e.deltaY * 0.0025));
+      worldRef.current.camRadiusTarget = Math.max(
+        10,
+        Math.min(70, worldRef.current.camRadiusTarget * scale),
+      );
+    };
+    host.addEventListener("mousedown", onDown);
     host.addEventListener("mousemove", onMove);
+    host.addEventListener("mouseup", onUp);
     host.addEventListener("mouseleave", onLeave);
-    host.addEventListener("click", onClick);
+    host.addEventListener("wheel", onWheel, { passive: false });
 
     // animation loop
     const tmp = new THREE.Vector3();
@@ -484,14 +542,14 @@ export default function GraphCanvas({
         const curve = new THREE.QuadraticBezierCurve3(a.clone(), mid, b.clone());
         eo.curve = curve;
 
-        const positions = eo.geom.attributes.position.array as Float32Array;
         for (let i = 0; i <= 24; i++) {
           const p = curve.getPoint(i / 24);
-          positions[3 * i] = p.x;
-          positions[3 * i + 1] = p.y;
-          positions[3 * i + 2] = p.z;
+          eo.segPositions[3 * i] = p.x;
+          eo.segPositions[3 * i + 1] = p.y;
+          eo.segPositions[3 * i + 2] = p.z;
         }
-        eo.geom.attributes.position.needsUpdate = true;
+        eo.lineGeom.setPositions(eo.segPositions);
+        eo.line.computeLineDistances();
 
         for (let i = 0; i < eo.pCount; i++) {
           const frac = (t * 0.25 + i / eo.pCount + eo.phase) % 1;
@@ -504,9 +562,8 @@ export default function GraphCanvas({
 
         const isSel =
           sel !== null && (eo.aDomain === sel || eo.bDomain === sel);
-        const base = 0.45 + eo.conf * 0.35;
-        (eo.line.material as THREE.LineBasicMaterial).opacity =
-          base * (isSel ? 1.6 : 1) * (sel && !isSel ? 0.4 : 1);
+        const base = 0.55 + eo.conf * 0.35;
+        eo.lineMat.opacity = base * (isSel ? 1.6 : 1) * (sel && !isSel ? 0.4 : 1);
         (eo.particles.material as THREE.PointsMaterial).opacity =
           isSel ? 1 : sel ? 0.45 : 1;
       });
@@ -528,13 +585,13 @@ export default function GraphCanvas({
         w.snow.geometry.attributes.position.needsUpdate = true;
       }
 
-      // camera parallax
-      w.camYaw += (w.camYawTarget - w.camYaw) * 0.05;
-      w.camPitch += (w.camPitchTarget - w.camPitch) * 0.05;
-      const radius = 28;
-      w.camera.position.x = Math.sin(w.camYaw) * radius;
-      w.camera.position.z = Math.cos(w.camYaw) * radius;
-      w.camera.position.y = Math.sin(w.camPitch) * radius * 0.6;
+      // camera easing (yaw, pitch, zoom)
+      w.camYaw += (w.camYawTarget - w.camYaw) * 0.08;
+      w.camPitch += (w.camPitchTarget - w.camPitch) * 0.08;
+      w.camRadius += (w.camRadiusTarget - w.camRadius) * 0.1;
+      w.camera.position.x = Math.sin(w.camYaw) * w.camRadius;
+      w.camera.position.z = Math.cos(w.camYaw) * w.camRadius;
+      w.camera.position.y = Math.sin(w.camPitch) * w.camRadius * 0.6;
       w.camera.lookAt(0, 0, 0);
 
       // project labels
@@ -568,9 +625,11 @@ export default function GraphCanvas({
 
     return () => {
       window.removeEventListener("resize", resize);
+      host.removeEventListener("mousedown", onDown);
       host.removeEventListener("mousemove", onMove);
+      host.removeEventListener("mouseup", onUp);
       host.removeEventListener("mouseleave", onLeave);
-      host.removeEventListener("click", onClick);
+      host.removeEventListener("wheel", onWheel);
       if (worldRef.current?.animFrame !== null && worldRef.current?.animFrame !== undefined) {
         cancelAnimationFrame(worldRef.current.animFrame);
       }
@@ -659,8 +718,8 @@ export default function GraphCanvas({
     w.edgeObjs.forEach((eo) => {
       w.edgesGroup.remove(eo.line);
       w.edgesGroup.remove(eo.particles);
-      eo.line.geometry.dispose();
-      (eo.line.material as THREE.Material).dispose();
+      eo.lineGeom.dispose();
+      eo.lineMat.dispose();
       eo.particles.geometry.dispose();
       (eo.particles.material as THREE.Material).dispose();
     });
@@ -670,6 +729,9 @@ export default function GraphCanvas({
     // translate SSE edges (which use display names) back to the node keys (domains).
     const nameToDomain = new Map<string, string>();
     Object.values(companies).forEach((c) => nameToDomain.set(c.name, c.domain));
+
+    const canvasW = w.renderer.domElement.clientWidth;
+    const canvasH = w.renderer.domElement.clientHeight;
 
     edges.forEach((edge) => {
       const aDomain = nameToDomain.get(edge.source);
@@ -682,21 +744,29 @@ export default function GraphCanvas({
       const color = EDGE_COLOR_NUM[edge.type];
       const conf =
         edge.confidence === "high" ? 1 : edge.confidence === "medium" ? 0.65 : 0.38;
-      const pts = Array.from({ length: 25 }, () => new THREE.Vector3());
-      const geom = new THREE.BufferGeometry().setFromPoints(pts);
-      const line = new THREE.Line(
-        geom,
-        new THREE.LineBasicMaterial({
-          color,
-          transparent: true,
-          opacity: 0.45 + conf * 0.35,
-          blending: THREE.AdditiveBlending,
-          depthWrite: false,
-        }),
-      );
+
+      // Thick screen-space line. `linewidth` is pixels when worldUnits=false.
+      // Base was effectively 1px; 5× → 5px for high, scaled down for lower confidence.
+      const segCount = 24;
+      const segPositions = new Float32Array((segCount + 1) * 3);
+      const lineGeom = new LineGeometry();
+      lineGeom.setPositions(segPositions);
+      const lineMat = new LineMaterial({
+        color,
+        linewidth: 2.5 + conf * 2.5,
+        transparent: true,
+        opacity: 0.55 + conf * 0.35,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        worldUnits: false,
+        dashed: false,
+      });
+      lineMat.resolution.set(canvasW, canvasH);
+      const line = new Line2(lineGeom, lineMat);
+      line.computeLineDistances();
       w.edgesGroup.add(line);
 
-      const pCount = Math.round(8 + conf * 14);
+      const pCount = Math.round(10 + conf * 16);
       const pGeom = new THREE.BufferGeometry();
       const pPos = new Float32Array(pCount * 3);
       pGeom.setAttribute("position", new THREE.BufferAttribute(pPos, 3));
@@ -704,7 +774,7 @@ export default function GraphCanvas({
         pGeom,
         new THREE.PointsMaterial({
           color,
-          size: 0.22,
+          size: 0.32,
           transparent: true,
           opacity: 1,
           depthWrite: false,
@@ -721,7 +791,9 @@ export default function GraphCanvas({
         aDomain,
         bDomain,
         line,
-        geom,
+        lineGeom,
+        lineMat,
+        segPositions,
         particles,
         pPos,
         pCount,

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { API_BASE, EDGE_COLOR, EDGE_LABEL } from "@/lib/graph";
 import type { CompanyNode, GraphEdge } from "@/lib/types";
@@ -22,21 +22,15 @@ export default function SidePanel({
 }: Props) {
   const [summaries, setSummaries] = useState<Record<string, string>>({});
   const [summaryState, setSummaryState] = useState<Record<string, SummaryState>>({});
+  const attemptedRef = useRef<Set<string>>(new Set());
 
-  useEffect(() => {
-    if (!selected) return;
-    if (selected.status !== "completed") return;
-    if (!selected.indexId) return;
-    // Only fetch once per domain. If it's already loading/loaded/errored, bail.
-    if (summaryState[selected.domain]) return;
-
+  // Shared fetcher so we can use it both for lazy (on-click) and eager (prefetch) paths.
+  function fetchSummary(domain: string, indexId: string) {
+    if (attemptedRef.current.has(domain)) return;
+    attemptedRef.current.add(domain);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 20000);
-    const domain = selected.domain;
-    const indexId = selected.indexId;
-
     setSummaryState((s) => ({ ...s, [domain]: "loading" }));
-
     fetch(
       `${API_BASE}/company/summary?domain=${encodeURIComponent(domain)}` +
         `&index_id=${encodeURIComponent(indexId)}`,
@@ -51,16 +45,38 @@ export default function SidePanel({
         setSummaryState((s) => ({ ...s, [domain]: "loaded" }));
       })
       .catch((err) => {
-        console.error("summary fetch failed", domain, err);
+        if ((err as Error).name !== "AbortError") {
+          console.error("summary fetch failed", domain, err);
+        }
         setSummaryState((s) => ({ ...s, [domain]: "error" }));
+        attemptedRef.current.delete(domain);
       })
       .finally(() => clearTimeout(timer));
+  }
 
-    return () => {
-      clearTimeout(timer);
-      controller.abort();
-    };
-  }, [selected, summaryState]);
+  const domain = selected?.domain;
+  const status = selected?.status;
+  const indexId = selected?.indexId;
+
+  // Lazy fetch on click (safety net — summary should usually be prefetched by now).
+  useEffect(() => {
+    if (!domain || status !== "completed" || !indexId) return;
+    fetchSummary(domain, indexId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [domain, status, indexId]);
+
+  // Prefetch summaries for every company that has finished indexing, so by the time
+  // the user clicks a node the panel is already populated. Fires in the background
+  // with no concurrency cap — Vertex handles 10 parallel Flash-Lite calls fine.
+  useEffect(() => {
+    Object.values(companies).forEach((c) => {
+      if (c.status !== "completed") return;
+      if (!c.indexId) return;
+      if (attemptedRef.current.has(c.domain)) return;
+      fetchSummary(c.domain, c.indexId);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [companies]);
 
   return (
     <aside className="relative flex h-full min-h-0 flex-col overflow-hidden rounded-[18px] border border-[rgba(140,200,255,0.08)] bg-[linear-gradient(180deg,rgba(10,18,40,0.65),rgba(3,6,16,0.7))] backdrop-blur-[14px]">

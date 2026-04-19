@@ -1,7 +1,7 @@
 import { EDGE_COLOR, EDGE_LABEL } from "@/lib/graph";
 import type { RelationshipType } from "@/lib/types";
 
-const RENDERED_TYPES: RelationshipType[] = [
+const TYPES: RelationshipType[] = [
   "partner",
   "competitor",
   "investor",
@@ -11,12 +11,19 @@ const RENDERED_TYPES: RelationshipType[] = [
 
 export default function Legend() {
   return (
-    <div className="flex items-center gap-4 rounded-full border border-white/5 bg-white/[0.03] px-4 py-2 text-xs text-[#c8d4eb]">
-      {RENDERED_TYPES.map((t) => (
-        <div key={t} className="flex items-center gap-1.5">
+    <div className="inline-flex items-center gap-4 rounded-full border border-[rgba(140,200,255,0.08)] bg-[rgba(10,18,40,0.5)] px-4 py-2 font-mono text-[10px] uppercase tracking-[0.16em] text-[var(--fg-dim)] backdrop-blur">
+      {TYPES.map((t) => (
+        <div
+          key={t}
+          className="inline-flex items-center gap-[7px]"
+          style={{ color: EDGE_COLOR[t] }}
+        >
           <span
-            className="inline-block h-[2px] w-5"
-            style={{ background: EDGE_COLOR[t] }}
+            className="inline-block h-[2px] w-[18px] rounded-[2px]"
+            style={{
+              background: EDGE_COLOR[t],
+              boxShadow: `0 0 6px ${EDGE_COLOR[t]}`,
+            }}
           />
           <span>{EDGE_LABEL[t]}</span>
         </div>
