@@ -41,3 +41,8 @@ logs/
 
 # Local artifacts
 /docs/api-notes.scratch.md
+src/backend/.cache/
+src/backend/scripts/extraction_output.json
+
+# Personal build plan — kept locally, never committed
+/CLAUDE.md
