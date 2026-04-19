@@ -1,41 +1,72 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useMemo } from "react";
 
-type Health = {
-  status: string;
-  hd_key_loaded: boolean;
-  gemini_key_loaded: boolean;
-};
-
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
+import GraphCanvas from "@/components/GraphCanvas";
+import Legend from "@/components/Legend";
+import QueryBar from "@/components/QueryBar";
+import SidePanel from "@/components/SidePanel";
+import StatusBar from "@/components/StatusBar";
+import { useQueryStream } from "@/hooks/useQueryStream";
 
 export default function Home() {
-  const [health, setHealth] = useState<Health | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const { state, run, select } = useQueryStream();
 
-  useEffect(() => {
-    fetch(`${API_BASE}/health`)
-      .then((r) => {
-        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-        return r.json();
-      })
-      .then(setHealth)
-      .catch((e: Error) => setError(e.message));
-  }, []);
+  const selected = useMemo(
+    () => (state.selectedDomain ? state.companies[state.selectedDomain] : null),
+    [state.companies, state.selectedDomain],
+  );
 
-  // TODO(hours 13-19): replace this with the Cytoscape graph component + search bar.
+  const isBusy =
+    state.phase === "parsing" ||
+    state.phase === "indexing" ||
+    state.phase === "extracting";
+
   return (
-    <main className="min-h-screen flex flex-col items-center justify-center p-8 gap-6">
-      <h1 className="text-3xl font-semibold tracking-tight">Landscape</h1>
-      <p className="text-sm text-[#8892b0]">Backend health check</p>
-      <pre className="rounded-lg border border-white/10 bg-white/[0.04] px-5 py-4 text-sm font-mono">
-        {error
-          ? `error: ${error}`
-          : health
-            ? JSON.stringify(health, null, 2)
-            : "loading…"}
-      </pre>
+    <main className="flex min-h-screen flex-col gap-3 p-4">
+      <header className="flex items-center justify-between gap-4">
+        <div className="flex items-baseline gap-2">
+          <h1 className="text-xl font-semibold tracking-tight text-[#e6f1fb]">
+            Landscape
+          </h1>
+          <span className="text-xs text-[#8892b0]">
+            A live knowledge graph of any industry
+          </span>
+        </div>
+      </header>
+
+      <div className="flex-none">
+        <QueryBar onSubmit={run} disabled={isBusy} />
+      </div>
+
+      <section className="grid flex-1 grid-cols-1 gap-3 lg:grid-cols-[3fr_1fr]">
+        <div className="relative min-h-[500px]">
+          <GraphCanvas
+            companies={state.companies}
+            edges={state.edges}
+            selectedDomain={state.selectedDomain}
+            onSelect={select}
+          />
+        </div>
+        <div className="min-h-[500px]">
+          <SidePanel
+            selected={selected ?? null}
+            edges={state.edges}
+            companies={state.companies}
+            onSelect={select}
+          />
+        </div>
+      </section>
+
+      <footer className="flex flex-wrap items-center justify-between gap-3">
+        <StatusBar
+          phase={state.phase}
+          companies={state.companies}
+          edgeCount={state.edges.length}
+          error={state.error}
+        />
+        <Legend />
+      </footer>
     </main>
   );
 }
