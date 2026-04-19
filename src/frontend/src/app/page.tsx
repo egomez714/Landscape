@@ -26,6 +26,11 @@ export default function Home() {
 
   const specimenCount = Object.keys(state.companies).length;
   const linkCount = state.edges.length;
+  const indexedCount = Object.values(state.companies).filter(
+    (c) => c.status === "completed",
+  ).length;
+  const emptyEcosystem =
+    state.phase === "done" && linkCount === 0 && indexedCount >= 2;
 
   return (
     <main
@@ -79,6 +84,31 @@ export default function Home() {
           onSelect={select}
         />
         <HudCorners specimenCount={specimenCount} linkCount={linkCount} />
+        {emptyEcosystem && (
+          <div className="pointer-events-none absolute left-1/2 top-1/2 z-[3] max-w-[520px] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-[rgba(140,200,255,0.12)] bg-[rgba(4,8,20,0.82)] px-6 py-5 text-center backdrop-blur-md">
+            <div className="mb-[6px] font-mono text-[10px] uppercase tracking-[0.25em] text-[var(--cyan-soft)]">
+              Silent ecosystem
+            </div>
+            <div className="mb-2 font-[var(--font-display)] text-[18px] leading-[1.3] text-[var(--fg)]">
+              No public cross-mentions found
+            </div>
+            <div className="text-[12.5px] leading-[1.55] text-[var(--fg-dim)]">
+              These companies don&apos;t publicly name each other on their websites —
+              common for enterprise biotech, pharma, and industrial incumbents. Try a
+              more open ecosystem like{" "}
+              <span className="text-[var(--cyan-soft)]">
+                AI agent infrastructure
+              </span>
+              ,{" "}
+              <span className="text-[var(--cyan-soft)]">vector database companies</span>
+              , or{" "}
+              <span className="text-[var(--cyan-soft)]">
+                developer tools startups
+              </span>
+              .
+            </div>
+          </div>
+        )}
       </section>
 
       {/* side panel */}

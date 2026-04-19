@@ -41,9 +41,13 @@ export default function StatusBar({
       text = `Linking · ${edgeCount} relationships · ${completed}/${total} indexed`;
       break;
     case "done":
-      text = `Trawl complete · ${completed} specimens · ${edgeCount} links${
-        failed ? ` · ${failed} lost` : ""
-      }`;
+      if (edgeCount === 0 && completed >= 2) {
+        text = `No public cross-mentions found · ${completed} specimens indexed · try a more open ecosystem`;
+      } else {
+        text = `Trawl complete · ${completed} specimens · ${edgeCount} links${
+          failed ? ` · ${failed} lost` : ""
+        }`;
+      }
       break;
     case "error":
       text = `Error${error ? ` (${error.stage}): ${error.message}` : ""}`;

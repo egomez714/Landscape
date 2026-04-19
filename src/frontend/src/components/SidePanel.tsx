@@ -37,16 +37,19 @@ export default function SidePanel({
       { signal: controller.signal },
     )
       .then(async (r) => {
+        if (r.status === 404) return { summary: "", notFound: true };
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.json();
+        return { ...(await r.json()), notFound: false };
       })
-      .then((data: { summary: string }) => {
+      .then((data: { summary: string; notFound: boolean }) => {
         setSummaries((s) => ({ ...s, [domain]: data.summary || "" }));
         setSummaryState((s) => ({ ...s, [domain]: "loaded" }));
       })
       .catch((err) => {
+        // AbortError (timeout) and HTTP errors are surfaced to the user via the
+        // "Summary unavailable." state; no need to shout in the console for 404s.
         if ((err as Error).name !== "AbortError") {
-          console.error("summary fetch failed", domain, err);
+          console.warn("summary fetch failed", domain, err);
         }
         setSummaryState((s) => ({ ...s, [domain]: "error" }));
         attemptedRef.current.delete(domain);

@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     hd_base_url: str = "https://api.humandelta.ai"
 
+    # Resolved from env var CACHE_DIR; defaults to the repo-local .cache dir so
+    # local dev matches the pre-Feature-1 behavior. On Railway, set CACHE_DIR=/data
+    # to use a mounted volume so crawls + edges survive redeploys.
+    cache_dir: Path = BACKEND_ROOT / ".cache"
+
     cors_origins: list[str] = ["http://localhost:3000"]
 
 
