@@ -55,7 +55,11 @@ function reducer(state: GraphState, action: Action): GraphState {
         ...state,
         companies: {
           ...state.companies,
-          [action.payload.domain]: { ...existing, status: "started" },
+          [action.payload.domain]: {
+            ...existing,
+            status: "started",
+            indexId: action.payload.index_id,
+          },
         },
       };
     }

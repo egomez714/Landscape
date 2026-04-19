@@ -57,8 +57,13 @@ def main() -> None:
             elif event == "index_failed":
                 print(f"{tag}  {payload['name']}: {payload['reason']}")
             elif event == "edge_found":
+                ev = payload.get("evidence", [])
+                first_text = ev[0]["text"] if ev else ""
                 print(f"{tag}  {payload['source']} --{payload['type']}[{payload['confidence']}]--> "
-                      f"{payload['target']}  ({payload['evidence_quote'][:80]})")
+                      f"{payload['target']}  ({len(ev)} quote(s): {first_text[:60]})")
+                for i, e in enumerate(ev[:3]):
+                    print(f"           [{i}] {e['text'][:90]}")
+                    print(f"               → {e['source_url']}")
             elif event == "done":
                 print(f"{tag}  {payload}")
                 break

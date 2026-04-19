@@ -22,14 +22,20 @@ export type CompanyNode = CompanyRef & {
   status: IndexStatus;
   pageCount?: number;
   failReason?: string;
+  indexId?: string; // needed to fetch the company summary
+};
+
+export type EvidenceSnippet = {
+  text: string;
+  source_url: string;
 };
 
 export type GraphEdge = {
   source: string;
   target: string;
   type: RelationshipType;
-  evidence_quote: string;
   confidence: Confidence;
+  evidence: EvidenceSnippet[];
 };
 
 // ---- SSE event wire shapes ----

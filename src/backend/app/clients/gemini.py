@@ -71,7 +71,10 @@ Strict rules:
 3. A single mention of a company's name (e.g. in a logo wall) is NOT a partnership. \
 Require explicit relationship language: "partnership with", "integrates with", \
 "invested in", "powered by", "hired from", etc.
-4. If uncertain, prefer "none" over guessing.
+4. Image filenames, URLs, and logo references (e.g. "logo.svg", "elastic-search.png", \
+"src=...", alt-text on images) are NEVER evidence of a relationship. If the only \
+evidence is a file URL or image reference, classify as "none".
+5. If uncertain, prefer "none" over guessing.
 """
 
 QUERY_PARSER_PROMPT = """\
@@ -82,6 +85,17 @@ User query: "{query}"
 Return 8-12 specific, well-known companies that match this query. For each, provide \
 its display name and its homepage URL (starting with https://www.). Prefer companies \
 with public blogs or docs that can be crawled. Skip vaporware and defunct companies.
+"""
+
+SUMMARY_PROMPT = """\
+Summarize what {company} does in ONE sentence, at most 20 words. Write it for a job \
+seeker researching this company — say what they build and who their customers are. \
+Use only the text below; do not invent facts.
+
+Text from their website:
+<<<
+{content}
+>>>
 """
 
 
@@ -158,3 +172,24 @@ class GeminiClient:
             if edge.evidence_quote.lower() not in haystack:
                 return None
         return edge
+
+    # ---- company summary ----
+
+    async def summarize_company(self, *, company_name: str, content: str) -> str:
+        """One-sentence company summary for the SidePanel."""
+        if not content.strip():
+            return ""
+        prompt = SUMMARY_PROMPT.format(company=company_name, content=content[:4000])
+        try:
+            resp = await asyncio.to_thread(
+                self._client.models.generate_content,
+                model=MODEL_QUERY_PARSER,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                ),
+            )
+        except genai_errors.ClientError:
+            return ""
+        return (resp.text or "").strip()

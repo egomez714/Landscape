@@ -48,11 +48,20 @@ class Edge(BaseModel):
         return v.strip()
 
 
+class EvidenceSnippet(BaseModel):
+    """One passage backing an edge, with a link to the page it came from."""
+    text: str
+    source_url: str
+
+
 class GraphEdge(BaseModel):
-    """An Edge attached to its source/target pair, as streamed to the frontend."""
+    """An Edge attached to its source/target pair, as streamed to the frontend.
+
+    `evidence` is a list of 1-3 snippets. The first is the LLM-chosen quote; the rest
+    are additional grep-matched passages from the same pair for context.
+    """
     source: str
     target: str
     type: RelationshipType
-    evidence_quote: str
     confidence: Confidence
-    source_url: str | None = None
+    evidence: list[EvidenceSnippet]

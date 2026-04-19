@@ -1,6 +1,8 @@
 "use client";
 
-import { EDGE_COLOR, EDGE_LABEL } from "@/lib/graph";
+import { useEffect, useState } from "react";
+
+import { API_BASE, EDGE_COLOR, EDGE_LABEL } from "@/lib/graph";
 import type { CompanyNode, GraphEdge } from "@/lib/types";
 
 type Props = {
@@ -10,19 +12,47 @@ type Props = {
   onSelect: (domain: string | null) => void;
 };
 
+type SummaryState = "idle" | "loading" | "loaded" | "error";
+
 export default function SidePanel({
   selected,
   edges,
   companies,
   onSelect,
 }: Props) {
+  const [summaries, setSummaries] = useState<Record<string, string>>({});
+  const [summaryState, setSummaryState] = useState<Record<string, SummaryState>>({});
+
+  // Lazy-fetch the company summary on selection. Cached per-domain in local state
+  // and per-(domain, index_id) on the backend.
+  useEffect(() => {
+    if (!selected) return;
+    if (selected.status !== "completed") return;
+    if (!selected.indexId) return;
+    if (summaryState[selected.domain]) return; // already fetching or done
+
+    setSummaryState((s) => ({ ...s, [selected.domain]: "loading" }));
+    fetch(
+      `${API_BASE}/company/summary?domain=${encodeURIComponent(selected.domain)}` +
+      `&index_id=${encodeURIComponent(selected.indexId)}`,
+    )
+      .then((r) => (r.ok ? r.json() : Promise.reject(r.statusText)))
+      .then((data: { summary: string }) => {
+        setSummaries((s) => ({ ...s, [selected.domain]: data.summary || "" }));
+        setSummaryState((s) => ({ ...s, [selected.domain]: "loaded" }));
+      })
+      .catch(() => {
+        setSummaryState((s) => ({ ...s, [selected.domain]: "error" }));
+      });
+  }, [selected, summaryState]);
+
   if (!selected) {
     return (
       <div className="flex h-full flex-col gap-3 rounded-xl border border-white/5 bg-white/[0.02] p-5 text-sm text-[#8892b0]">
-        <div className="text-[#e6f1fb] font-medium">No node selected</div>
+        <div className="font-medium text-[#e6f1fb]">No node selected</div>
         <p>
-          Click a company in the graph to see its relationships and the
-          verbatim passages that support them.
+          Click a company in the graph to see its relationships and the verbatim
+          passages that support them.
         </p>
       </div>
     );
@@ -31,25 +61,24 @@ export default function SidePanel({
   const connected = edges.filter(
     (e) => e.source === selected.name || e.target === selected.name,
   );
-
   const statusLabel = {
     pending: "queued",
     started: "indexing",
     completed: "indexed",
     failed: "failed",
   }[selected.status];
+  const summary = summaries[selected.domain];
+  const sState = summaryState[selected.domain];
 
   return (
     <div className="flex h-full flex-col gap-4 overflow-y-auto rounded-xl border border-white/5 bg-white/[0.02] p-5 text-sm">
       <div>
-        <div className="text-lg font-semibold text-[#e6f1fb]">
-          {selected.name}
-        </div>
+        <div className="text-lg font-semibold text-[#e6f1fb]">{selected.name}</div>
         <a
           href={selected.url}
           target="_blank"
           rel="noopener noreferrer"
-          className="break-all text-xs text-[#8892b0] hover:text-[#c8d4eb] underline underline-offset-2"
+          className="break-all text-xs text-[#8892b0] underline underline-offset-2 hover:text-[#c8d4eb]"
         >
           {selected.url}
         </a>
@@ -60,6 +89,21 @@ export default function SidePanel({
         {selected.failReason && (
           <div className="mt-2 rounded-md border border-red-400/30 bg-red-400/5 px-2 py-1 text-xs text-red-300">
             {selected.failReason}
+          </div>
+        )}
+
+        {/* one-sentence summary */}
+        {selected.status === "completed" && (
+          <div className="mt-3 rounded-md border border-white/5 bg-white/[0.03] px-3 py-2 text-[13px] leading-relaxed text-[#c8d4eb]">
+            {sState === "loading" && (
+              <span className="text-[#8892b0]">Summarizing…</span>
+            )}
+            {sState === "loaded" && (summary || (
+              <span className="text-[#8892b0]">No summary available.</span>
+            ))}
+            {sState === "error" && (
+              <span className="text-[#8892b0]">Summary unavailable.</span>
+            )}
           </div>
         )}
       </div>
@@ -99,7 +143,7 @@ export default function SidePanel({
                         <button
                           type="button"
                           onClick={() => onSelect(otherDomain)}
-                          className="text-[#c8d4eb] hover:text-[#e6f1fb] underline underline-offset-2"
+                          className="text-[#c8d4eb] underline underline-offset-2 hover:text-[#e6f1fb]"
                         >
                           {otherName}
                         </button>
@@ -108,9 +152,24 @@ export default function SidePanel({
                       )}
                     </span>
                   </div>
-                  <div className="mt-2 text-xs italic text-[#b3c1d9]">
-                    “{edge.evidence_quote}”
-                  </div>
+                  <ul className="mt-2 flex flex-col gap-2">
+                    {edge.evidence.map((ev, j) => (
+                      <li
+                        key={`${edge.source}-${edge.target}-ev-${j}`}
+                        className="text-xs leading-relaxed"
+                      >
+                        <span className="italic text-[#b3c1d9]">“{ev.text}”</span>{" "}
+                        <a
+                          href={ev.source_url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="whitespace-nowrap text-[#00d9ff]/80 underline underline-offset-2 hover:text-[#00d9ff]"
+                        >
+                          source ↗
+                        </a>
+                      </li>
+                    ))}
+                  </ul>
                 </li>
               );
             })}
