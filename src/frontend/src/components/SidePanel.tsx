@@ -23,68 +23,155 @@ export default function SidePanel({
   const [summaries, setSummaries] = useState<Record<string, string>>({});
   const [summaryState, setSummaryState] = useState<Record<string, SummaryState>>({});
 
-  // Lazy-fetch the company summary on selection. Cached per-domain in local state
-  // and per-(domain, index_id) on the backend.
   useEffect(() => {
     if (!selected) return;
     if (selected.status !== "completed") return;
     if (!selected.indexId) return;
-    if (summaryState[selected.domain]) return; // already fetching or done
+    // Only fetch once per domain. If it's already loading/loaded/errored, bail.
+    if (summaryState[selected.domain]) return;
 
-    setSummaryState((s) => ({ ...s, [selected.domain]: "loading" }));
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20000);
+    const domain = selected.domain;
+    const indexId = selected.indexId;
+
+    setSummaryState((s) => ({ ...s, [domain]: "loading" }));
+
     fetch(
-      `${API_BASE}/company/summary?domain=${encodeURIComponent(selected.domain)}` +
-      `&index_id=${encodeURIComponent(selected.indexId)}`,
+      `${API_BASE}/company/summary?domain=${encodeURIComponent(domain)}` +
+        `&index_id=${encodeURIComponent(indexId)}`,
+      { signal: controller.signal },
     )
-      .then((r) => (r.ok ? r.json() : Promise.reject(r.statusText)))
-      .then((data: { summary: string }) => {
-        setSummaries((s) => ({ ...s, [selected.domain]: data.summary || "" }));
-        setSummaryState((s) => ({ ...s, [selected.domain]: "loaded" }));
+      .then(async (r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
       })
-      .catch(() => {
-        setSummaryState((s) => ({ ...s, [selected.domain]: "error" }));
-      });
+      .then((data: { summary: string }) => {
+        setSummaries((s) => ({ ...s, [domain]: data.summary || "" }));
+        setSummaryState((s) => ({ ...s, [domain]: "loaded" }));
+      })
+      .catch((err) => {
+        console.error("summary fetch failed", domain, err);
+        setSummaryState((s) => ({ ...s, [domain]: "error" }));
+      })
+      .finally(() => clearTimeout(timer));
+
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
   }, [selected, summaryState]);
 
-  if (!selected) {
-    return (
-      <div className="flex h-full flex-col gap-3 rounded-xl border border-white/5 bg-white/[0.02] p-5 text-sm text-[#8892b0]">
-        <div className="font-medium text-[#e6f1fb]">No node selected</div>
-        <p>
-          Click a company in the graph to see its relationships and the verbatim
-          passages that support them.
-        </p>
-      </div>
-    );
-  }
+  return (
+    <aside className="relative flex h-full min-h-0 flex-col overflow-hidden rounded-[18px] border border-[rgba(140,200,255,0.08)] bg-[linear-gradient(180deg,rgba(10,18,40,0.65),rgba(3,6,16,0.7))] backdrop-blur-[14px]">
+      {/* top accent line */}
+      <span className="pointer-events-none absolute left-0 right-0 top-0 h-px bg-[linear-gradient(90deg,transparent,rgba(0,229,255,0.4),transparent)]" />
 
-  const connected = edges.filter(
-    (e) => e.source === selected.name || e.target === selected.name,
+      <div className="abyss-scroll min-h-0 flex-1 overflow-y-auto p-[18px]">
+        <SectionLabel
+          label="Specimen dossier"
+          count={selected ? connectedEdges(selected, edges).length : null}
+        />
+        {!selected ? <EmptyPanel /> : <PanelBody
+          selected={selected}
+          edges={edges}
+          companies={companies}
+          onSelect={onSelect}
+          summary={summaries[selected.domain]}
+          summaryState={summaryState[selected.domain] ?? "idle"}
+        />}
+      </div>
+    </aside>
   );
+}
+
+function SectionLabel({ label, count }: { label: string; count: number | null }) {
+  return (
+    <div className="mb-[10px] flex items-center justify-between font-mono text-[9.5px] uppercase tracking-[0.22em] text-[var(--fg-faint)]">
+      <span>{label}</span>
+      {count !== null && (
+        <span className="rounded-[4px] bg-[rgba(0,229,255,0.08)] px-[6px] py-[2px] text-[9px] text-[var(--cyan-soft)]">
+          {count}
+        </span>
+      )}
+      {count === null && <span>—</span>}
+    </div>
+  );
+}
+
+function EmptyPanel() {
+  return (
+    <div className="px-1 pt-2 pb-2 text-[13px] leading-[1.6] text-[var(--fg-dim)]">
+      <div className="mb-[10px] font-mono text-[10px] uppercase tracking-[0.2em] text-[var(--fg-faint)]">
+        Awaiting capture
+      </div>
+      No specimen selected. Click a luring node in the survey to pull it into the dossier.
+      <div className="mt-[14px] font-mono text-[10px] leading-[1.8] tracking-[0.1em] text-[var(--fg-faint)]">
+        › hover &nbsp;<span className="text-[var(--cyan-soft)]">inspect</span>
+        <br />
+        › click &nbsp;&nbsp;<span className="text-[var(--cyan-soft)]">lock dossier</span>
+        <br />
+        › esc &nbsp;&nbsp;&nbsp;&nbsp;<span className="text-[var(--cyan-soft)]">release</span>
+      </div>
+    </div>
+  );
+}
+
+function PanelBody({
+  selected,
+  edges,
+  companies,
+  onSelect,
+  summary,
+  summaryState,
+}: {
+  selected: CompanyNode;
+  edges: GraphEdge[];
+  companies: Record<string, CompanyNode>;
+  onSelect: (domain: string | null) => void;
+  summary: string | undefined;
+  summaryState: SummaryState;
+}) {
+  const connected = connectedEdges(selected, edges);
   const statusLabel = {
     pending: "queued",
     started: "indexing",
     completed: "indexed",
     failed: "failed",
   }[selected.status];
-  const summary = summaries[selected.domain];
-  const sState = summaryState[selected.domain];
+  const statusColor =
+    selected.status === "completed"
+      ? "var(--green)"
+      : selected.status === "failed"
+        ? "#ff6b6b"
+        : "var(--amber)";
 
   return (
-    <div className="flex h-full flex-col gap-4 overflow-y-auto rounded-xl border border-white/5 bg-white/[0.02] p-5 text-sm">
-      <div>
-        <div className="text-lg font-semibold text-[#e6f1fb]">{selected.name}</div>
+    <>
+      <div className="flex flex-col gap-[6px]">
+        <div className="text-[22px] leading-[1.1] font-normal font-[var(--font-display)] text-[var(--fg)]">
+          {selected.name}
+        </div>
         <a
           href={selected.url}
           target="_blank"
           rel="noopener noreferrer"
-          className="break-all text-xs text-[#8892b0] underline underline-offset-2 hover:text-[#c8d4eb]"
+          className="break-all font-mono text-[10.5px] text-[var(--fg-dim)] hover:text-[var(--cyan-soft)]"
         >
           {selected.url}
         </a>
-        <div className="mt-1 text-xs text-[#8892b0]">
-          Status: {statusLabel}
-          {selected.pageCount ? ` · ${selected.pageCount} pages indexed` : ""}
+        <div className="mt-[4px] flex gap-[10px] font-mono text-[10px] uppercase tracking-[0.16em] text-[var(--fg-faint)]">
+          <span className="inline-flex items-center gap-[4px]">
+            <span
+              className="inline-block h-[6px] w-[6px] rounded-full"
+              style={{
+                background: statusColor,
+                boxShadow: `0 0 8px ${statusColor}`,
+              }}
+            />
+            <span style={{ color: statusColor }}>{statusLabel}</span>
+          </span>
+          {selected.pageCount ? <span>{selected.pageCount} pages</span> : null}
         </div>
         {selected.failReason && (
           <div className="mt-2 rounded-md border border-red-400/30 bg-red-400/5 px-2 py-1 text-xs text-red-300">
@@ -92,80 +179,80 @@ export default function SidePanel({
           </div>
         )}
 
-        {/* one-sentence summary */}
+        {/* summary */}
         {selected.status === "completed" && (
-          <div className="mt-3 rounded-md border border-white/5 bg-white/[0.03] px-3 py-2 text-[13px] leading-relaxed text-[#c8d4eb]">
-            {sState === "loading" && (
-              <span className="text-[#8892b0]">Summarizing…</span>
+          <div className="mt-3 border-l border-[rgba(0,229,255,0.35)] px-3 py-1 text-[13px] italic leading-[1.55] text-[#b9cce8]">
+            {summaryState === "loading" && (
+              <span className="not-italic text-[var(--fg-faint)]">Summarizing…</span>
             )}
-            {sState === "loaded" && (summary || (
-              <span className="text-[#8892b0]">No summary available.</span>
+            {summaryState === "loaded" && (summary || (
+              <span className="not-italic text-[var(--fg-faint)]">
+                No summary available.
+              </span>
             ))}
-            {sState === "error" && (
-              <span className="text-[#8892b0]">Summary unavailable.</span>
+            {summaryState === "error" && (
+              <span className="not-italic text-[var(--fg-faint)]">
+                Summary unavailable.
+              </span>
             )}
           </div>
         )}
       </div>
 
-      <div className="border-t border-white/5 pt-3">
-        <div className="mb-2 text-xs uppercase tracking-wide text-[#8892b0]">
-          Relationships ({connected.length})
-        </div>
+      <div className="mt-[14px]">
+        <SectionLabel label="Relationships" count={connected.length} />
         {connected.length === 0 ? (
-          <div className="text-xs text-[#8892b0]">
-            No relationships found in the indexed content.
+          <div className="font-mono text-[10px] text-[var(--fg-faint)]">
+            No links detected.
           </div>
         ) : (
-          <ul className="flex flex-col gap-3">
+          <ul className="flex flex-col">
             {connected.map((edge, i) => {
               const otherName =
                 edge.source === selected.name ? edge.target : edge.source;
               const otherDomain = Object.values(companies).find(
                 (c) => c.name === otherName,
               )?.domain;
+              const color = EDGE_COLOR[edge.type];
               return (
                 <li
                   key={`${edge.source}-${edge.target}-${i}`}
-                  className="rounded-lg border border-white/5 bg-white/[0.03] p-3"
+                  onClick={() => otherDomain && onSelect(otherDomain)}
+                  className="mb-[10px] cursor-pointer rounded-[10px] border border-[rgba(140,200,255,0.08)] bg-[rgba(10,18,40,0.4)] px-3 py-[10px] transition hover:border-[rgba(0,229,255,0.25)] hover:bg-[rgba(0,229,255,0.04)]"
                 >
-                  <div className="flex items-center gap-2 text-xs">
+                  <div className="flex items-center gap-2 text-[12px]">
                     <span
                       className="inline-block h-2 w-2 rounded-full"
-                      style={{ background: EDGE_COLOR[edge.type] }}
+                      style={{ background: color, boxShadow: `0 0 6px ${color}` }}
                     />
-                    <span className="font-medium text-[#e6f1fb]">
+                    <span
+                      className="font-mono text-[10px] uppercase tracking-[0.16em]"
+                      style={{ color }}
+                    >
                       {EDGE_LABEL[edge.type]}
                     </span>
-                    <span className="text-[#8892b0]">[{edge.confidence}]</span>
-                    <span className="ml-auto">
-                      {otherDomain ? (
-                        <button
-                          type="button"
-                          onClick={() => onSelect(otherDomain)}
-                          className="text-[#c8d4eb] underline underline-offset-2 hover:text-[#e6f1fb]"
-                        >
-                          {otherName}
-                        </button>
-                      ) : (
-                        <span className="text-[#c8d4eb]">{otherName}</span>
-                      )}
+                    <span className="font-mono text-[9px] tracking-[0.1em] text-[var(--fg-faint)]">
+                      [{edge.confidence}]
+                    </span>
+                    <span className="ml-auto text-[12.5px] font-medium text-[var(--fg)]">
+                      {otherName}
                     </span>
                   </div>
-                  <ul className="mt-2 flex flex-col gap-2">
+                  <ul className="mt-2 flex flex-col gap-[6px]">
                     {edge.evidence.map((ev, j) => (
                       <li
-                        key={`${edge.source}-${edge.target}-ev-${j}`}
-                        className="text-xs leading-relaxed"
+                        key={j}
+                        className="text-[11.5px] leading-[1.5] text-[#a7bad4]"
                       >
-                        <span className="italic text-[#b3c1d9]">“{ev.text}”</span>{" "}
+                        <span className="italic text-[#c1d4ee]">“{ev.text}”</span>{" "}
                         <a
                           href={ev.source_url}
                           target="_blank"
                           rel="noopener noreferrer"
-                          className="whitespace-nowrap text-[#00d9ff]/80 underline underline-offset-2 hover:text-[#00d9ff]"
+                          onClick={(e) => e.stopPropagation()}
+                          className="ml-[6px] font-mono text-[9.5px] tracking-[0.12em] text-[var(--cyan-soft)] opacity-85 hover:opacity-100 hover:underline"
                         >
-                          source ↗
+                          src ↗
                         </a>
                       </li>
                     ))}
@@ -176,6 +263,12 @@ export default function SidePanel({
           </ul>
         )}
       </div>
-    </div>
+    </>
+  );
+}
+
+function connectedEdges(selected: CompanyNode, edges: GraphEdge[]): GraphEdge[] {
+  return edges.filter(
+    (e) => e.source === selected.name || e.target === selected.name,
   );
 }

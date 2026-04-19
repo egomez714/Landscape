@@ -1,19 +1,135 @@
 @import "tailwindcss";
 
 :root {
-  --background: #0a0e1a;
-  --foreground: #e6f1fb;
+  --bg-0: #02040a;
+  --bg-1: #05091a;
+  --bg-2: #0a1226;
+  --ink: #020308;
+  --fg: #dbe9ff;
+  --fg-dim: #7a8fb8;
+  --fg-faint: #445574;
+  --rim: rgba(120, 200, 255, 0.12);
+  --rim-strong: rgba(120, 200, 255, 0.28);
+  --cyan: #00e5ff;
+  --cyan-soft: #6cf0ff;
+  --violet: #9d8cff;
+  --green: #5dcaa5;
+  --amber: #f0c978;
+  --coral: #ff8c64;
+  --glow: 0 0 24px rgba(0, 229, 255, 0.35);
+  --panel: rgba(8, 14, 30, 0.55);
+  --panel-edge: rgba(140, 200, 255, 0.08);
+
+  --font-display: "Fraunces", ui-serif, serif;
+  --font-body: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-background: var(--bg-0);
+  --color-foreground: var(--fg);
+  --font-sans: var(--font-body);
+  --font-mono: var(--font-mono);
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: radial-gradient(
+    ellipse 90% 60% at 50% -10%,
+    #06122a 0%,
+    #02040a 55%,
+    #000 100%
+  );
+  color: var(--fg);
+  font-family: var(--font-body);
+  font-size: 14px;
+  overflow: hidden;
+  letter-spacing: -0.005em;
+}
+
+/* Pulse animation for brand dot / beacons */
+@keyframes abyss-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.55;
+    transform: scale(0.85);
+  }
+}
+
+/* Radar scan sweep inside the query field */
+@keyframes abyss-scan {
+  0% {
+    transform: translate(-4px, -50%) rotate(0deg);
+    opacity: 0;
+  }
+  10% {
+    opacity: 1;
+  }
+  100% {
+    transform: translate(-4px, -50%) rotate(360deg);
+    opacity: 0;
+  }
+}
+
+/* Beacon ping ring */
+@keyframes abyss-ping {
+  0% {
+    transform: scale(0.8);
+    opacity: 0.8;
+  }
+  100% {
+    transform: scale(2.2);
+    opacity: 0;
+  }
+}
+
+/* Scrollbar (used inside side panel) */
+.abyss-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0, 229, 255, 0.2) transparent;
+}
+.abyss-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+.abyss-scroll::-webkit-scrollbar-thumb {
+  background: rgba(0, 229, 255, 0.2);
+  border-radius: 3px;
+}
+
+/* Node label (HTML overlay over the three.js canvas) */
+.node-label {
+  position: absolute;
+  transform: translate(-50%, 8px);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: rgba(219, 233, 255, 0.85);
+  background: rgba(2, 6, 18, 0.7);
+  border: 1px solid rgba(140, 200, 255, 0.12);
+  padding: 3px 7px;
+  border-radius: 4px;
+  white-space: nowrap;
+  pointer-events: none;
+  backdrop-filter: blur(4px);
+  text-transform: uppercase;
+  will-change: left, top, display;
+}
+.node-label.selected {
+  color: var(--cyan-soft);
+  border-color: rgba(0, 229, 255, 0.5);
+  box-shadow: 0 0 16px rgba(0, 229, 255, 0.3);
+}
+.node-label .st {
+  color: var(--fg-faint);
+  margin-left: 6px;
 }

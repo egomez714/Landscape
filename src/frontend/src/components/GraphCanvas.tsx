@@ -1,34 +1,272 @@
 "use client";
 
-import cytoscape, { type Core, type ElementDefinition } from "cytoscape";
-// @ts-expect-error — no types shipped
-import fcose from "cytoscape-fcose";
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useRef } from "react";
+import * as THREE from "three";
 
-import {
-  EDGE_COLOR,
-  nodeBorderColor,
-  nodeDiameter,
-  nodeOpacity,
-} from "@/lib/graph";
-import type { CompanyNode, GraphEdge } from "@/lib/types";
-
-if (typeof window !== "undefined") {
-  try {
-    cytoscape.use(fcose);
-  } catch {
-    // already registered on hot-reload — ignore
-  }
-}
+import { EDGE_COLOR_HEX, ZONE_PALETTES } from "@/lib/graph";
+import type {
+  CompanyNode,
+  GraphEdge as GraphEdgeT,
+  RelationshipType,
+} from "@/lib/types";
 
 type Props = {
   companies: Record<string, CompanyNode>;
-  edges: GraphEdge[];
+  edges: GraphEdgeT[];
   selectedDomain: string | null;
   onSelect: (domain: string | null) => void;
 };
 
-const LAYOUT_DEBOUNCE_MS = 250;
+type ZoneKey = keyof typeof ZONE_PALETTES;
+
+// Numeric versions of edge colors for three.js (hex ints).
+const EDGE_COLOR_NUM: Record<RelationshipType, number> = {
+  partner: 0x00e5ff,
+  competitor: 0xff8c64,
+  investor: 0xb19cff,
+  downstream: 0x5dcaa5,
+  talent: 0xf0c978,
+  none: 0x394b6a,
+};
+
+// ---------- node factory ----------
+
+type NodeUser = {
+  domain: string;
+  displayName: string;
+  body: THREE.Mesh;
+  bodyMat: THREE.ShaderMaterial;
+  halo: THREE.Sprite;
+  bulbGlow: THREE.Mesh;
+  light: THREE.PointLight;
+  bobPhase: number;
+  bobFreq: number;
+  bobAmp: number;
+  spinOffset: number;
+  home: THREE.Vector3;
+  diameter: number;
+};
+
+type EdgeObj = {
+  edge: GraphEdgeT;
+  a: THREE.Group;
+  b: THREE.Group;
+  aDomain: string;
+  bDomain: string;
+  line: THREE.Line;
+  geom: THREE.BufferGeometry;
+  particles: THREE.Points;
+  pPos: Float32Array;
+  pCount: number;
+  conf: number;
+  color: number;
+  phase: number;
+  curveOffset: number;
+  curve?: THREE.QuadraticBezierCurve3;
+};
+
+function randSpherePosition(i: number, total: number): THREE.Vector3 {
+  const phi = Math.acos(1 - (2 * (i + 0.5)) / total);
+  const theta = Math.PI * (1 + Math.sqrt(5)) * i;
+  const r = 11 + (i % 3) * 0.6;
+  return new THREE.Vector3(
+    Math.cos(theta) * Math.sin(phi) * r,
+    Math.sin(theta) * Math.sin(phi) * r * 0.6,
+    (Math.cos(phi) * r - 2) * 0.7,
+  );
+}
+
+let cachedGlowTex: THREE.Texture | null = null;
+function makeGlowTexture(): THREE.Texture {
+  if (cachedGlowTex) return cachedGlowTex;
+  const c = document.createElement("canvas");
+  c.width = c.height = 128;
+  const g = c.getContext("2d")!;
+  const grad = g.createRadialGradient(64, 64, 2, 64, 64, 64);
+  grad.addColorStop(0, "rgba(255,255,255,1)");
+  grad.addColorStop(0.2, "rgba(255,255,255,0.6)");
+  grad.addColorStop(0.5, "rgba(255,255,255,0.18)");
+  grad.addColorStop(1, "rgba(255,255,255,0)");
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 128, 128);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  cachedGlowTex = tex;
+  return tex;
+}
+
+function createAnglerfishNode(
+  company: CompanyNode,
+  pos: THREE.Vector3,
+  pal: (typeof ZONE_PALETTES)[ZoneKey],
+  glow: number,
+): THREE.Group {
+  const group = new THREE.Group();
+  group.position.copy(pos);
+
+  const pageCount = company.pageCount ?? 10;
+  const diameter = 0.9 + Math.min(1.4, Math.sqrt(Math.max(1, pageCount)) / 7);
+
+  // body
+  const bodyGeo = new THREE.SphereGeometry(diameter, 42, 32);
+  const bodyMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uBody: { value: new THREE.Color(pal.body) },
+      uRim: { value: new THREE.Color(pal.rim) },
+      uTime: { value: 0 },
+      uGlow: { value: glow },
+      uSelected: { value: 0 },
+    },
+    vertexShader: `
+      varying vec3 vNormal;
+      varying vec3 vViewPos;
+      void main() {
+        vNormal = normalize(normalMatrix * normal);
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        vViewPos = -mv.xyz;
+        gl_Position = projectionMatrix * mv;
+      }`,
+    fragmentShader: `
+      uniform vec3 uBody; uniform vec3 uRim;
+      uniform float uTime; uniform float uGlow; uniform float uSelected;
+      varying vec3 vNormal; varying vec3 vViewPos;
+      void main() {
+        vec3 v = normalize(vViewPos);
+        float fres = pow(1.0 - max(dot(vNormal, v), 0.0), 2.0);
+        // Stronger fresnel mix so the rim actually reads in the dark scene
+        vec3 col = mix(uBody, uRim, clamp(fres * 1.15 * uGlow, 0.0, 1.0));
+        // Small top-down cheat light so the body has some base brightness
+        float topLight = max(vNormal.y, 0.0) * 0.25;
+        col += uRim * topLight * 0.4;
+        float n = sin(vNormal.x*6.0 + uTime*0.3) * sin(vNormal.y*5.0) * 0.04;
+        col += n;
+        col += uRim * fres * uSelected * 0.9;
+        gl_FragColor = vec4(col, 1.0);
+      }`,
+  });
+  const body = new THREE.Mesh(bodyGeo, bodyMat);
+  group.add(body);
+
+  // lure arc
+  const lureLen = diameter * 1.25;
+  const arcPts: THREE.Vector3[] = [];
+  const steps = 20;
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const a = (Math.PI * 0.5) * t;
+    arcPts.push(
+      new THREE.Vector3(
+        Math.sin(a) * lureLen * 0.55,
+        Math.cos(a) * lureLen + diameter * 0.2,
+        0,
+      ),
+    );
+  }
+  const curve = new THREE.CatmullRomCurve3(arcPts);
+  const tubeGeo = new THREE.TubeGeometry(curve, 30, 0.035, 6, false);
+  const tubeMat = new THREE.MeshBasicMaterial({
+    color: 0x15243f,
+    transparent: true,
+    opacity: 0.85,
+  });
+  group.add(new THREE.Mesh(tubeGeo, tubeMat));
+
+  const tipPos = arcPts[arcPts.length - 1].clone();
+
+  // bulb core + glow halo + point light
+  const bulbCore = new THREE.Mesh(
+    new THREE.SphereGeometry(0.09, 16, 12),
+    new THREE.MeshBasicMaterial({ color: 0xffffff }),
+  );
+  bulbCore.position.copy(tipPos);
+  group.add(bulbCore);
+
+  const bulbGlow = new THREE.Mesh(
+    new THREE.SphereGeometry(0.26, 20, 16),
+    new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      uniforms: {
+        uColor: { value: new THREE.Color(pal.lure) },
+        uIntensity: { value: 1 },
+      },
+      vertexShader: `
+        varying vec3 vNormal; varying vec3 vView;
+        void main() {
+          vNormal = normalize(normalMatrix * normal);
+          vec4 mv = modelViewMatrix * vec4(position, 1.0);
+          vView = -mv.xyz;
+          gl_Position = projectionMatrix * mv;
+        }`,
+      fragmentShader: `
+        uniform vec3 uColor; uniform float uIntensity;
+        varying vec3 vNormal; varying vec3 vView;
+        void main() {
+          float f = pow(1.0 - abs(dot(normalize(vView), vNormal)), 3.0);
+          gl_FragColor = vec4(uColor * uIntensity, f);
+        }`,
+    }),
+  );
+  bulbGlow.position.copy(tipPos);
+  group.add(bulbGlow);
+
+  const halo = new THREE.Sprite(
+    new THREE.SpriteMaterial({
+      map: makeGlowTexture(),
+      color: pal.lure,
+      transparent: true,
+      opacity: 0.75 * glow,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    }),
+  );
+  halo.scale.set(1.6, 1.6, 1);
+  halo.position.copy(tipPos);
+  group.add(halo);
+
+  const light = new THREE.PointLight(pal.lure, 0.9 * glow, 6, 2);
+  light.position.copy(tipPos);
+  group.add(light);
+
+  // fins
+  const finMat = new THREE.MeshBasicMaterial({
+    color: 0x0a1025,
+    side: THREE.DoubleSide,
+    transparent: true,
+    opacity: 0.85,
+  });
+  for (const sideSign of [-1, 1] as const) {
+    const fin = new THREE.Mesh(
+      new THREE.PlaneGeometry(diameter * 0.8, diameter * 0.5),
+      finMat,
+    );
+    fin.position.set(sideSign * diameter * 0.85, -diameter * 0.1, 0);
+    fin.rotation.z = sideSign * 0.4;
+    fin.rotation.y = sideSign * 0.2;
+    group.add(fin);
+  }
+
+  const userData: NodeUser = {
+    domain: company.domain,
+    displayName: company.name,
+    body,
+    bodyMat,
+    halo,
+    bulbGlow,
+    light,
+    bobPhase: Math.random() * Math.PI * 2,
+    bobFreq: 0.4 + Math.random() * 0.3,
+    bobAmp: 0.15 + Math.random() * 0.2,
+    spinOffset: Math.random() * 0.4 - 0.2,
+    home: pos.clone(),
+    diameter,
+  };
+  group.userData = userData;
+  return group;
+}
+
+// ---------- component ----------
 
 export default function GraphCanvas({
   companies,
@@ -37,172 +275,488 @@ export default function GraphCanvas({
   onSelect,
 }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
-  const cyRef = useRef<Core | null>(null);
-  const layoutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const labelLayerRef = useRef<HTMLDivElement | null>(null);
+  const onSelectRef = useRef(onSelect);
+  onSelectRef.current = onSelect;
 
-  const elements = useMemo<ElementDefinition[]>(() => {
-    const nodes: ElementDefinition[] = Object.values(companies).map((c) => ({
-      data: {
-        id: c.domain,
-        label: c.name,
-        status: c.status,
-        pageCount: c.pageCount ?? 0,
-      },
-    }));
-    const edgeEls: ElementDefinition[] = edges.map((e, i) => ({
-      data: {
-        id: `${e.source}|${e.target}|${i}`,
-        source: findDomain(companies, e.source) ?? e.source,
-        target: findDomain(companies, e.target) ?? e.target,
-        type: e.type,
-        confidence: e.confidence,
-      },
-    }));
-    return [...nodes, ...edgeEls];
-  }, [companies, edges]);
+  // World refs — single instance across the component lifetime
+  const worldRef = useRef<{
+    renderer: THREE.WebGLRenderer;
+    scene: THREE.Scene;
+    camera: THREE.PerspectiveCamera;
+    fog: THREE.FogExp2;
+    ambient: THREE.AmbientLight;
+    nodesGroup: THREE.Group;
+    edgesGroup: THREE.Group;
+    ambientGroup: THREE.Group;
+    nodes: Map<string, THREE.Group>;
+    labels: Map<string, HTMLDivElement>;
+    edgeObjs: EdgeObj[];
+    snow: THREE.Points | null;
+    rays: THREE.Mesh[];
+    raycaster: THREE.Raycaster;
+    nodeMeshes: THREE.Object3D[];
+    camYaw: number;
+    camPitch: number;
+    camYawTarget: number;
+    camPitchTarget: number;
+    selectedDomain: string | null;
+    animFrame: number | null;
+    clock: THREE.Clock;
+    glow: number;
+  } | null>(null);
 
-  // Initialize Cytoscape once.
+  // ---- init (run once) ----
   useEffect(() => {
-    if (!hostRef.current || cyRef.current) return;
-
-    const cy = cytoscape({
-      container: hostRef.current,
-      elements: [],
-      wheelSensitivity: 0.2,
-      style: [
-        {
-          selector: "node",
-          style: {
-            "background-color": "#1a2542",
-            "border-width": 2,
-            "border-color": (ele: cytoscape.NodeSingular) =>
-              nodeBorderColor(ele.data("status")),
-            opacity: (ele: cytoscape.NodeSingular) => nodeOpacity(ele.data("status")),
-            width: (ele: cytoscape.NodeSingular) => nodeDiameter(ele.data("pageCount")),
-            height: (ele: cytoscape.NodeSingular) => nodeDiameter(ele.data("pageCount")),
-            label: "data(label)",
-            "font-size": 11,
-            "font-family": "Inter, ui-sans-serif, system-ui",
-            color: "#e6f1fb",
-            "text-valign": "bottom",
-            "text-margin-y": 6,
-            "text-background-color": "#0a0e1a",
-            "text-background-opacity": 0.75,
-            "text-background-padding": "3px",
-            "text-border-width": 0,
-          },
-        },
-        {
-          selector: "node:selected",
-          style: {
-            "border-color": "#ffffff",
-            "border-width": 3,
-            "background-color": "#2a3a66",
-          },
-        },
-        {
-          selector: "edge",
-          style: {
-            width: (ele: cytoscape.EdgeSingular) =>
-              ele.data("confidence") === "high"
-                ? 2.5
-                : ele.data("confidence") === "medium"
-                  ? 1.75
-                  : 1,
-            "line-color": (ele: cytoscape.EdgeSingular) =>
-              EDGE_COLOR[ele.data("type") as keyof typeof EDGE_COLOR] ?? "#394b6a",
-            "curve-style": "bezier",
-            opacity: 0.85,
-          },
-        },
-        {
-          selector: "edge:selected",
-          style: {
-            opacity: 1,
-            width: 3,
-          },
-        },
-      ],
+    if (!canvasRef.current || !hostRef.current) return;
+    const pal = ZONE_PALETTES.abyss;
+    const renderer = new THREE.WebGLRenderer({
+      canvas: canvasRef.current,
+      antialias: true,
+      alpha: true,
     });
+    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.55;
 
-    cy.on("tap", "node", (evt) => {
-      onSelect(evt.target.id());
-    });
-    cy.on("tap", (evt) => {
-      if (evt.target === cy) onSelect(null);
-    });
+    const scene = new THREE.Scene();
+    scene.background = null;
 
-    cyRef.current = cy;
-  }, [onSelect]);
+    const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 200);
+    camera.position.set(0, 0, 28);
 
-  // Sync elements into Cytoscape whenever state changes.
+    const fog = new THREE.FogExp2(pal.fog, pal.fogDens);
+    scene.fog = fog;
+
+    const ambient = new THREE.AmbientLight(pal.ambient, 1.35);
+    scene.add(ambient);
+
+    const topLight = new THREE.DirectionalLight(0x9bc4f0, 0.55);
+    topLight.position.set(0.4, 1, 0.3);
+    scene.add(topLight);
+
+    // Fill: a warm rim-light from behind-right so nodes read with depth
+    const fill = new THREE.DirectionalLight(0x4a6fa8, 0.35);
+    fill.position.set(-0.6, -0.2, -0.8);
+    scene.add(fill);
+
+    const nodesGroup = new THREE.Group();
+    const edgesGroup = new THREE.Group();
+    const ambientGroup = new THREE.Group();
+    scene.add(ambientGroup, edgesGroup, nodesGroup);
+
+    // marine snow
+    const snowCount = 240;
+    const snowGeom = new THREE.BufferGeometry();
+    const snowPos = new Float32Array(snowCount * 3);
+    const snowVel = new Float32Array(snowCount * 3);
+    for (let i = 0; i < snowCount; i++) {
+      snowPos[3 * i] = (Math.random() - 0.5) * 70;
+      snowPos[3 * i + 1] = (Math.random() - 0.5) * 50;
+      snowPos[3 * i + 2] = (Math.random() - 0.5) * 60 - 5;
+      snowVel[3 * i] = (Math.random() - 0.5) * 0.015;
+      snowVel[3 * i + 1] = -0.008 - Math.random() * 0.015;
+      snowVel[3 * i + 2] = (Math.random() - 0.5) * 0.01;
+    }
+    snowGeom.setAttribute("position", new THREE.BufferAttribute(snowPos, 3));
+    snowGeom.setAttribute("aVel", new THREE.BufferAttribute(snowVel, 3));
+    const snow = new THREE.Points(
+      snowGeom,
+      new THREE.PointsMaterial({
+        color: pal.particles,
+        size: 0.08,
+        sizeAttenuation: true,
+        transparent: true,
+        opacity: 0.55,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      }),
+    );
+    ambientGroup.add(snow);
+
+    worldRef.current = {
+      renderer,
+      scene,
+      camera,
+      fog,
+      ambient,
+      nodesGroup,
+      edgesGroup,
+      ambientGroup,
+      nodes: new Map(),
+      labels: new Map(),
+      edgeObjs: [],
+      snow,
+      rays: [],
+      raycaster: new THREE.Raycaster(),
+      nodeMeshes: [],
+      camYaw: 0,
+      camPitch: 0,
+      camYawTarget: 0,
+      camPitchTarget: 0,
+      selectedDomain: null,
+      animFrame: null,
+      clock: new THREE.Clock(),
+      glow: 1.0,
+    };
+
+    // resize
+    const resize = () => {
+      if (!hostRef.current || !worldRef.current) return;
+      const w = hostRef.current.clientWidth;
+      const h = hostRef.current.clientHeight;
+      worldRef.current.renderer.setSize(w, h, false);
+      worldRef.current.camera.aspect = w / h;
+      worldRef.current.camera.updateProjectionMatrix();
+    };
+    resize();
+    window.addEventListener("resize", resize);
+
+    // mouse parallax
+    const host = hostRef.current;
+    const onMove = (e: MouseEvent) => {
+      if (!worldRef.current || !hostRef.current) return;
+      const r = hostRef.current.getBoundingClientRect();
+      const mx = ((e.clientX - r.left) / r.width) * 2 - 1;
+      const my = -((e.clientY - r.top) / r.height) * 2 + 1;
+      worldRef.current.camYawTarget = mx * 0.25;
+      worldRef.current.camPitchTarget = my * 0.15;
+    };
+    const onLeave = () => {
+      if (!worldRef.current) return;
+      worldRef.current.camYawTarget = 0;
+      worldRef.current.camPitchTarget = 0;
+    };
+    const onClick = (e: MouseEvent) => {
+      if (!worldRef.current || !hostRef.current) return;
+      const w = worldRef.current;
+      const r = hostRef.current.getBoundingClientRect();
+      const mx = ((e.clientX - r.left) / r.width) * 2 - 1;
+      const my = -((e.clientY - r.top) / r.height) * 2 + 1;
+      w.raycaster.setFromCamera(new THREE.Vector2(mx, my), w.camera);
+      const hits = w.raycaster.intersectObjects(w.nodeMeshes, true);
+      if (hits.length) {
+        const domain = hits[0].object.userData.nodeDomain as string | undefined;
+        if (domain) onSelectRef.current(domain);
+      } else {
+        onSelectRef.current(null);
+      }
+    };
+    host.addEventListener("mousemove", onMove);
+    host.addEventListener("mouseleave", onLeave);
+    host.addEventListener("click", onClick);
+
+    // animation loop
+    const tmp = new THREE.Vector3();
+    const animate = () => {
+      if (!worldRef.current) return;
+      const w = worldRef.current;
+      const t = w.clock.getElapsedTime();
+
+      // node bob + lure pulse
+      w.nodes.forEach((g) => {
+        const u = g.userData as NodeUser;
+        g.position.y = u.home.y + Math.sin(t * u.bobFreq + u.bobPhase) * u.bobAmp;
+        g.position.x = u.home.x + Math.cos(t * u.bobFreq * 0.7 + u.bobPhase) * u.bobAmp * 0.5;
+        g.position.z = u.home.z + Math.sin(t * u.bobFreq * 0.5 + u.bobPhase) * u.bobAmp * 0.3;
+        g.rotation.y = Math.sin(t * 0.3 + u.bobPhase) * 0.15 + u.spinOffset;
+        u.bodyMat.uniforms.uTime.value = t;
+        const pulse = 0.8 + 0.35 * Math.sin(t * 1.6 + u.bobPhase * 2);
+        (u.bulbGlow.material as THREE.ShaderMaterial).uniforms.uIntensity.value =
+          pulse * w.glow;
+        (u.halo.material as THREE.SpriteMaterial).opacity =
+          (0.45 + 0.35 * pulse) * w.glow;
+        u.light.intensity = pulse * 0.9 * w.glow;
+      });
+
+      // edges (geometry + particle flow)
+      const sel = w.selectedDomain;
+      w.edgeObjs.forEach((eo) => {
+        const a = eo.a.position;
+        const b = eo.b.position;
+        const mid = new THREE.Vector3().addVectors(a, b).multiplyScalar(0.5);
+        const dir = new THREE.Vector3().subVectors(b, a);
+        const perp = new THREE.Vector3(-dir.y, dir.x, 0).normalize();
+        mid.add(perp.multiplyScalar(eo.curveOffset * 0.5));
+        mid.z += 1.2 + eo.curveOffset * 0.3;
+        const curve = new THREE.QuadraticBezierCurve3(a.clone(), mid, b.clone());
+        eo.curve = curve;
+
+        const positions = eo.geom.attributes.position.array as Float32Array;
+        for (let i = 0; i <= 24; i++) {
+          const p = curve.getPoint(i / 24);
+          positions[3 * i] = p.x;
+          positions[3 * i + 1] = p.y;
+          positions[3 * i + 2] = p.z;
+        }
+        eo.geom.attributes.position.needsUpdate = true;
+
+        for (let i = 0; i < eo.pCount; i++) {
+          const frac = (t * 0.25 + i / eo.pCount + eo.phase) % 1;
+          const p = curve.getPoint(frac);
+          eo.pPos[3 * i] = p.x;
+          eo.pPos[3 * i + 1] = p.y;
+          eo.pPos[3 * i + 2] = p.z;
+        }
+        eo.particles.geometry.attributes.position.needsUpdate = true;
+
+        const isSel =
+          sel !== null && (eo.aDomain === sel || eo.bDomain === sel);
+        const base = 0.45 + eo.conf * 0.35;
+        (eo.line.material as THREE.LineBasicMaterial).opacity =
+          base * (isSel ? 1.6 : 1) * (sel && !isSel ? 0.4 : 1);
+        (eo.particles.material as THREE.PointsMaterial).opacity =
+          isSel ? 1 : sel ? 0.45 : 1;
+      });
+
+      // marine snow drift
+      if (w.snow) {
+        const pos = w.snow.geometry.attributes.position.array as Float32Array;
+        const vel = w.snow.geometry.attributes.aVel.array as Float32Array;
+        for (let i = 0; i < pos.length / 3; i++) {
+          pos[3 * i] += vel[3 * i];
+          pos[3 * i + 1] += vel[3 * i + 1];
+          pos[3 * i + 2] += vel[3 * i + 2];
+          if (pos[3 * i + 1] < -25) {
+            pos[3 * i + 1] = 25;
+            pos[3 * i] = (Math.random() - 0.5) * 70;
+          }
+          if (Math.abs(pos[3 * i]) > 36) pos[3 * i] *= -0.95;
+        }
+        w.snow.geometry.attributes.position.needsUpdate = true;
+      }
+
+      // camera parallax
+      w.camYaw += (w.camYawTarget - w.camYaw) * 0.05;
+      w.camPitch += (w.camPitchTarget - w.camPitch) * 0.05;
+      const radius = 28;
+      w.camera.position.x = Math.sin(w.camYaw) * radius;
+      w.camera.position.z = Math.cos(w.camYaw) * radius;
+      w.camera.position.y = Math.sin(w.camPitch) * radius * 0.6;
+      w.camera.lookAt(0, 0, 0);
+
+      // project labels
+      if (hostRef.current && labelLayerRef.current) {
+        const rect = hostRef.current.getBoundingClientRect();
+        w.labels.forEach((el, domain) => {
+          const g = w.nodes.get(domain);
+          if (!g) {
+            el.style.display = "none";
+            return;
+          }
+          g.getWorldPosition(tmp);
+          tmp.y -= (g.userData as NodeUser).diameter + 0.15;
+          tmp.project(w.camera);
+          if (tmp.z > 1 || tmp.z < -1) {
+            el.style.display = "none";
+            return;
+          }
+          const x = (tmp.x * 0.5 + 0.5) * rect.width;
+          const y = (-tmp.y * 0.5 + 0.5) * rect.height;
+          el.style.display = "block";
+          el.style.left = `${x}px`;
+          el.style.top = `${y}px`;
+        });
+      }
+
+      w.renderer.render(w.scene, w.camera);
+      w.animFrame = requestAnimationFrame(animate);
+    };
+    animate();
+
+    return () => {
+      window.removeEventListener("resize", resize);
+      host.removeEventListener("mousemove", onMove);
+      host.removeEventListener("mouseleave", onLeave);
+      host.removeEventListener("click", onClick);
+      if (worldRef.current?.animFrame !== null && worldRef.current?.animFrame !== undefined) {
+        cancelAnimationFrame(worldRef.current.animFrame);
+      }
+      worldRef.current?.renderer.dispose();
+      worldRef.current?.labels.forEach((el) => el.remove());
+      worldRef.current = null;
+    };
+  }, []);
+
+  // ---- sync companies → nodes ----
   useEffect(() => {
-    const cy = cyRef.current;
-    if (!cy) return;
+    const w = worldRef.current;
+    if (!w || !labelLayerRef.current) return;
+    const pal = ZONE_PALETTES.abyss;
+    const wantedDomains = new Set(Object.keys(companies));
+    const totalWanted = wantedDomains.size;
 
-    cy.batch(() => {
-      // Upsert: add new, update existing data.
-      const seen = new Set<string>();
-      for (const el of elements) {
-        const id = el.data?.id as string;
-        if (!id) continue;
-        seen.add(id);
-        const existing = cy.getElementById(id);
-        if (existing.empty()) {
-          cy.add(el);
-        } else {
-          existing.data(el.data);
+    // remove gone
+    for (const [domain, g] of Array.from(w.nodes.entries())) {
+      if (!wantedDomains.has(domain)) {
+        w.nodesGroup.remove(g);
+        g.traverse((o) => {
+          if (o instanceof THREE.Mesh) {
+            o.geometry?.dispose();
+            if (Array.isArray(o.material)) o.material.forEach((m) => m.dispose());
+            else (o.material as THREE.Material).dispose();
+          }
+        });
+        w.nodes.delete(domain);
+        const lab = w.labels.get(domain);
+        if (lab) {
+          lab.remove();
+          w.labels.delete(domain);
         }
       }
-      // Remove any elements no longer in the set (e.g. after a new query).
-      cy.elements().forEach((el) => {
-        if (!seen.has(el.id())) el.remove();
+    }
+
+    // add new in a deterministic order so positions are stable
+    const ordered = Object.values(companies).sort((a, b) =>
+      a.domain.localeCompare(b.domain),
+    );
+    ordered.forEach((c, i) => {
+      if (w.nodes.has(c.domain)) return;
+      const pos = randSpherePosition(i, Math.max(totalWanted, 4));
+      const g = createAnglerfishNode(c, pos, pal, w.glow);
+      g.userData = { ...(g.userData as NodeUser), domain: c.domain };
+      g.traverse((o) => {
+        o.userData.nodeDomain = c.domain;
       });
+      w.nodes.set(c.domain, g);
+      w.nodesGroup.add(g);
+
+      const lab = document.createElement("div");
+      lab.className = "node-label";
+      lab.innerHTML = `${c.name}${
+        c.status !== "completed" ? ` <span class="st">· ${c.status}</span>` : ""
+      }`;
+      labelLayerRef.current!.appendChild(lab);
+      w.labels.set(c.domain, lab);
     });
 
-    // Debounced layout re-run.
-    if (layoutTimerRef.current) clearTimeout(layoutTimerRef.current);
-    layoutTimerRef.current = setTimeout(() => {
-      if (cy.elements().length === 0) return;
-      cy.layout({
-        name: "fcose",
-        animate: true,
-        animationDuration: 450,
-        nodeRepulsion: 6000,
-        idealEdgeLength: 120,
-        edgeElasticity: 0.35,
-        gravity: 0.25,
-        randomize: false,
-        padding: 40,
-        fit: true,
-      } as cytoscape.LayoutOptions).run();
-    }, LAYOUT_DEBOUNCE_MS);
-  }, [elements]);
+    // update labels (status text) for existing nodes
+    w.labels.forEach((el, domain) => {
+      const c = companies[domain];
+      if (!c) return;
+      el.innerHTML = `${c.name}${
+        c.status !== "completed" ? ` <span class="st">· ${c.status}</span>` : ""
+      }`;
+    });
 
-  // Reflect external selection (e.g. clicking in the side panel) into Cytoscape.
+    // refresh raycast list
+    w.nodeMeshes = [];
+    w.nodes.forEach((g) => {
+      g.traverse((o) => {
+        if ((o as THREE.Mesh).isMesh) w.nodeMeshes.push(o);
+      });
+    });
+  }, [companies]);
+
+  // ---- sync edges ----
   useEffect(() => {
-    const cy = cyRef.current;
-    if (!cy) return;
-    cy.$("node:selected").unselect();
-    if (selectedDomain) {
-      cy.getElementById(selectedDomain).select();
-    }
+    const w = worldRef.current;
+    if (!w) return;
+
+    // tear down old
+    w.edgeObjs.forEach((eo) => {
+      w.edgesGroup.remove(eo.line);
+      w.edgesGroup.remove(eo.particles);
+      eo.line.geometry.dispose();
+      (eo.line.material as THREE.Material).dispose();
+      eo.particles.geometry.dispose();
+      (eo.particles.material as THREE.Material).dispose();
+    });
+    w.edgeObjs = [];
+
+    // Build a name → domain resolver from the current companies prop so we can
+    // translate SSE edges (which use display names) back to the node keys (domains).
+    const nameToDomain = new Map<string, string>();
+    Object.values(companies).forEach((c) => nameToDomain.set(c.name, c.domain));
+
+    edges.forEach((edge) => {
+      const aDomain = nameToDomain.get(edge.source);
+      const bDomain = nameToDomain.get(edge.target);
+      if (!aDomain || !bDomain) return;
+      const a = w.nodes.get(aDomain);
+      const b = w.nodes.get(bDomain);
+      if (!a || !b) return;
+
+      const color = EDGE_COLOR_NUM[edge.type];
+      const conf =
+        edge.confidence === "high" ? 1 : edge.confidence === "medium" ? 0.65 : 0.38;
+      const pts = Array.from({ length: 25 }, () => new THREE.Vector3());
+      const geom = new THREE.BufferGeometry().setFromPoints(pts);
+      const line = new THREE.Line(
+        geom,
+        new THREE.LineBasicMaterial({
+          color,
+          transparent: true,
+          opacity: 0.45 + conf * 0.35,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+        }),
+      );
+      w.edgesGroup.add(line);
+
+      const pCount = Math.round(8 + conf * 14);
+      const pGeom = new THREE.BufferGeometry();
+      const pPos = new Float32Array(pCount * 3);
+      pGeom.setAttribute("position", new THREE.BufferAttribute(pPos, 3));
+      const particles = new THREE.Points(
+        pGeom,
+        new THREE.PointsMaterial({
+          color,
+          size: 0.22,
+          transparent: true,
+          opacity: 1,
+          depthWrite: false,
+          blending: THREE.AdditiveBlending,
+          map: makeGlowTexture(),
+        }),
+      );
+      w.edgesGroup.add(particles);
+
+      w.edgeObjs.push({
+        edge,
+        a,
+        b,
+        aDomain,
+        bDomain,
+        line,
+        geom,
+        particles,
+        pPos,
+        pCount,
+        conf,
+        color,
+        phase: Math.random() * 10,
+        curveOffset: (Math.random() - 0.5) * 2.5,
+      });
+    });
+  }, [edges, companies]);
+
+  // ---- sync selection ----
+  useEffect(() => {
+    const w = worldRef.current;
+    if (!w) return;
+    w.selectedDomain = selectedDomain;
+    w.nodes.forEach((g, domain) => {
+      const u = g.userData as NodeUser;
+      u.bodyMat.uniforms.uSelected.value = domain === selectedDomain ? 1 : 0;
+    });
+    w.labels.forEach((el, domain) => {
+      el.classList.toggle("selected", domain === selectedDomain);
+    });
   }, [selectedDomain]);
 
   return (
-    <div
-      ref={hostRef}
-      className="h-full w-full rounded-xl border border-white/5 bg-[#060914]"
-    />
+    <div ref={hostRef} className="relative h-full w-full overflow-hidden rounded-[18px] border border-[rgba(140,200,255,0.08)] bg-[radial-gradient(ellipse_120%_80%_at_50%_0%,_#061228_0%,_#020615_60%,_#000105_100%)]">
+      <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" />
+      <div ref={labelLayerRef} className="pointer-events-none absolute inset-0" />
+      {/* crosshair */}
+      <div className="pointer-events-none absolute left-1/2 top-1/2 h-[26px] w-[26px] -translate-x-1/2 -translate-y-1/2 rounded-full border border-[rgba(0,229,255,0.18)]">
+        <span className="absolute left-1/2 -top-[6px] -bottom-[6px] w-[1px] -translate-x-1/2 bg-[rgba(0,229,255,0.18)]" />
+        <span className="absolute top-1/2 -left-[6px] -right-[6px] h-[1px] -translate-y-1/2 bg-[rgba(0,229,255,0.18)]" />
+      </div>
+    </div>
   );
 }
 
-function findDomain(
-  companies: Record<string, CompanyNode>,
-  name: string,
-): string | null {
-  for (const c of Object.values(companies)) {
-    if (c.name === name) return c.domain;
-  }
-  return null;
-}

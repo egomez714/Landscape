@@ -29,40 +29,55 @@ export default function StatusBar({
   let text: string;
   switch (phase) {
     case "idle":
-      text = "Ready — type a query above.";
+      text = "Ready · drop a query to begin the dive";
       break;
     case "parsing":
-      text = "Parsing query via Gemini…";
+      text = "Parsing query · mapping specimens";
       break;
     case "indexing":
-      text = `Indexing ${completed + failed}/${total} via Human Delta · ${started} in flight`;
+      text = `Trawling · ${completed + failed}/${total} captured · ${started} in flight`;
       break;
     case "extracting":
-      text = `Extracting relationships · ${edgeCount} edges so far · ${completed}/${total} indexed`;
+      text = `Linking · ${edgeCount} relationships · ${completed}/${total} indexed`;
       break;
     case "done":
-      text = `Done · ${completed} companies · ${edgeCount} edges${failed ? ` · ${failed} failed` : ""}`;
+      text = `Trawl complete · ${completed} specimens · ${edgeCount} links${
+        failed ? ` · ${failed} lost` : ""
+      }`;
       break;
     case "error":
       text = `Error${error ? ` (${error.stage}): ${error.message}` : ""}`;
       break;
   }
 
-  const color =
+  const beaconColor =
     phase === "error"
-      ? "text-red-300"
+      ? "#ff6b6b"
       : phase === "done"
-        ? "text-[#5dcaa5]"
-        : "text-[#c8d4eb]";
+        ? "var(--green)"
+        : "var(--cyan)";
 
   return (
-    <div
-      className={`flex items-center gap-2 rounded-full border border-white/5 bg-white/[0.03] px-4 py-2 text-xs ${color}`}
-    >
-      {phase !== "idle" && phase !== "done" && phase !== "error" && (
-        <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-[#00d9ff]" />
-      )}
-      {text}
+    <div className="inline-flex items-center gap-[10px] rounded-full border border-[rgba(140,200,255,0.08)] bg-[rgba(10,18,40,0.5)] px-[14px] py-2 font-mono text-[10.5px] uppercase tracking-[0.16em] text-[var(--fg-dim)] backdrop-blur">
+      <span
+        className="relative inline-block h-2 w-2 rounded-full"
+        style={{
+          background: beaconColor,
+          boxShadow: `0 0 10px ${beaconColor}`,
+        }}
+      >
+        {phase !== "error" && (
+          <span
+            className="absolute -inset-[4px] rounded-full border"
+            style={{
+              borderColor: beaconColor,
+              animation: "abyss-ping 1.8s ease-out infinite",
+            }}
+          />
+        )}
+      </span>
+      <span>Survey</span>
+      <b className="font-medium text-[var(--fg)]">{text}</b>
     </div>
   );
 }
