@@ -44,7 +44,15 @@ def _save(cache: dict[str, dict]) -> None:
 
 
 async def get(hd: "HumanDeltaClient", domain: str) -> tuple[str, int] | None:
-    """Return (index_id, page_count) if the cached index is still valid."""
+    """Return (index_id, page_count) if the cached index is still valid.
+
+    Two checks:
+      1. HD reports status=completed for the index_id
+      2. HD's VFS still has content at /source/website/<domain>
+    HD sometimes keeps #1 true even when the user clears Sources in the
+    dashboard, leaving us with a live index_id pointing at an empty filesystem.
+    Both checks must pass.
+    """
     cache = _load()
     entry = cache.get(domain)
     if not entry:
@@ -60,6 +68,21 @@ async def get(hd: "HumanDeltaClient", domain: str) -> tuple[str, int] | None:
         _save(cache)
         return None
     if status.status != "completed":
+        cache.pop(domain, None)
+        _save(cache)
+        return None
+    # Second check: does the VFS still have content? Cheap stat call.
+    try:
+        has_content = await hd.source_has_content(
+            index_id=index_id, source_domain=domain,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.info("stat check failed for %s (%s); evicting", domain, e)
+        cache.pop(domain, None)
+        _save(cache)
+        return None
+    if not has_content:
+        log.info("cache for %s points to empty VFS; evicting", domain)
         cache.pop(domain, None)
         _save(cache)
         return None

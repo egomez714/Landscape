@@ -95,11 +95,13 @@ async def _pipeline(query_text: str) -> AsyncIterator[dict]:
                 })
 
         if len(indexed) < 2:
+            # Emit only `error` — the frontend reducer treats error as a terminal
+            # phase and EventSource close handles the no-more-events contract.
+            # Previously we also emitted `done`, which clobbered the error state.
             yield _sse("error", {
                 "stage": "extraction",
                 "message": f"only {len(indexed)} companies indexed successfully, need >=2",
             })
-            yield _sse("done", {"companies": len(indexed), "edges": 0})
             return
 
         # Step 4: extract edges across unordered pairs; stream as they land.

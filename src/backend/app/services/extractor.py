@@ -46,7 +46,11 @@ async def _extract_pair(
     a: IndexedCompany,
     b: IndexedCompany,
 ) -> ExtractionEvent:
-    # Gather evidence from BOTH corpora; stronger signal than one-directional.
+    # Gather evidence from BOTH corpora. Previously we picked one direction by
+    # line count and threw the rest away; that collapsed to whichever side had
+    # the bigger crawl and silently produced wrong-direction `uses` edges when
+    # the "winning" direction was a migrate or compare page. Now both sides go
+    # to the LLM tagged with their page_type, and the model picks direction.
     ev_ab, ev_ba = await asyncio.gather(
         hd.find_cooccurrences(
             source_index_id=a.index_id,
@@ -61,20 +65,14 @@ async def _extract_pair(
             target_name=a.name,
         ),
     )
-    # Pick the source direction with more evidence; that's the one we query Gemini on.
-    if len(ev_ab) >= len(ev_ba):
-        src, tgt, evidence = a, b, ev_ab
-    else:
-        src, tgt, evidence = b, a, ev_ba
-
-    if not evidence:
+    if not ev_ab and not ev_ba:
         return PairSkippedEvent(source=a.name, target=b.name, reason="no_evidence")
 
-    # Gemini sees only the text; URLs stay on our side.
     edge = await gemini.extract_relationship(
-        source_name=src.name,
-        target_name=tgt.name,
-        evidence=[e.text for e in evidence],
+        a_name=a.name,
+        b_name=b.name,
+        evidence_a_to_b=ev_ab,
+        evidence_b_to_a=ev_ba,
     )
     if edge is None:
         return PairSkippedEvent(
@@ -83,7 +81,25 @@ async def _extract_pair(
     if edge.type == "none":
         return PairSkippedEvent(source=a.name, target=b.name, reason="none_classification")
 
-    snippets = _build_evidence_snippets(edge.evidence_quote, evidence)
+    # Map LLM-picked direction back to (source, target). `symmetric` falls
+    # through to a_to_b — the GraphEdge only has two slots and the UI doesn't
+    # distinguish symmetric visually, so picking A as source is consistent
+    # with the prompt's convention that A is the first-named entity.
+    if edge.direction == "b_to_a":
+        src, tgt = b, a
+    else:
+        src, tgt = a, b
+
+    # Snippet source matches the direction the LLM chose, so users clicking the
+    # quote land on the page the model actually used to justify it. Fall back
+    # to the combined pool if the quote doesn't substring-match the primary
+    # direction (rare; usually means the LLM picked a quote from the other
+    # corpus for a `symmetric` classification).
+    primary_evidence = ev_ab if src is a else ev_ba
+    secondary_evidence = ev_ba if src is a else ev_ab
+    snippets = _build_evidence_snippets(
+        edge.evidence_quote, primary_evidence, secondary_evidence,
+    )
     return EdgeFoundEvent(edge=GraphEdge(
         source=src.name,
         target=tgt.name,
@@ -95,23 +111,39 @@ async def _extract_pair(
 
 def _build_evidence_snippets(
     primary_quote: str,
-    evidence: list[EvidenceLine],
+    primary_evidence: list[EvidenceLine],
+    secondary_evidence: list[EvidenceLine] = (),  # type: ignore[assignment]
     max_total: int = 3,
 ) -> list[EvidenceSnippet]:
-    """Return up to `max_total` snippets. First matches the LLM's chosen quote; rest
-    are the other grep lines, in order, for context."""
+    """Return up to `max_total` snippets. The first matches the LLM's chosen
+    quote (searched in primary first, then secondary). Remaining slots fill
+    from the primary pool, then the secondary, preserving order."""
     pq = primary_quote.lower().strip()
-    # Find the grep line that the LLM's quote came from — substring match, first wins.
+    pool_primary = list(primary_evidence)
+    pool_secondary = list(secondary_evidence)
+
     primary_idx = next(
-        (i for i, e in enumerate(evidence) if pq and pq in e.text.lower()),
+        (i for i, e in enumerate(pool_primary) if pq and pq in e.text.lower()),
         None,
     )
+    secondary_idx: int | None = None
+    if primary_idx is None:
+        secondary_idx = next(
+            (i for i, e in enumerate(pool_secondary) if pq and pq in e.text.lower()),
+            None,
+        )
+
     ordered: list[EvidenceLine] = []
     if primary_idx is not None:
-        ordered.append(evidence[primary_idx])
-        ordered.extend(e for i, e in enumerate(evidence) if i != primary_idx)
+        ordered.append(pool_primary[primary_idx])
+        ordered.extend(e for i, e in enumerate(pool_primary) if i != primary_idx)
+        ordered.extend(pool_secondary)
+    elif secondary_idx is not None:
+        ordered.append(pool_secondary[secondary_idx])
+        ordered.extend(pool_primary)
+        ordered.extend(e for i, e in enumerate(pool_secondary) if i != secondary_idx)
     else:
-        ordered = list(evidence)
+        ordered = pool_primary + pool_secondary
     return [
         EvidenceSnippet(text=e.text, source_url=e.source_url)
         for e in ordered[:max_total]

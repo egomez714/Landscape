@@ -66,7 +66,17 @@ type NodeUser = {
   home: THREE.Vector3;
   diameter: number;
   fishYaw: number;
+  // Feature 3: scales halo / bulb / point-light intensity in "All research"
+  // mode. 1.0 for current-query nodes; higher for companies that have
+  // appeared in multiple stored queries. Deliberately sub-linear (log2) so
+  // popular nodes stand out without blowing out the scene.
+  heat: number;
 };
+
+function heatFromQueryCount(queryCount: number | undefined): number {
+  if (!queryCount || queryCount <= 1) return 1;
+  return Math.min(2.2, 1 + Math.log2(queryCount) * 0.35);
+}
 
 type EdgeObj = {
   edge: GraphEdgeT;
@@ -88,11 +98,23 @@ type EdgeObj = {
 const EDGE_SEGS = 30;
 
 function randSpherePosition(i: number, total: number): THREE.Vector3 {
-  // Fibonacci-spiral distribution on a lens-shaped surface.
-  // Base radius scales with sqrt(total) so 20 companies don't crowd like 4 do.
-  const phi = Math.acos(1 - (2 * (i + 0.5)) / total);
+  // Fibonacci-spiral distribution, extended with rings so an unbounded `i`
+  // still lands somewhere sensible. The original formula maps i ∈ [0, N-1]
+  // across a lens via `phi = acos(1 - 2*(i+0.5)/N)`; beyond N the acos
+  // argument saturates near -1 and every new node clusters at the south
+  // pole (that was the "older query compact" bunching). Instead we split i
+  // into (ring, ringI): ringI occupies a slot on the canonical lens, ring
+  // pushes the node onto a wider shell. Single-query layouts (i < N) stay
+  // visually identical to before.
+  const ring = Math.floor(i / total);
+  const ringI = i % total;
+  const raw = 1 - (2 * (ringI + 0.5)) / total;
+  const phi = Math.acos(Math.min(1, Math.max(-1, raw)));
+  // Golden-angle theta stays continuous across rings so successive nodes
+  // rotate instead of stacking directly above their predecessors.
   const theta = Math.PI * (1 + Math.sqrt(5)) * i;
-  const r = 8 + Math.sqrt(Math.max(1, total)) * 2.6 + (i % 3) * 0.6;
+  const rBase = 8 + Math.sqrt(Math.max(1, total)) * 2.6;
+  const r = rBase + ring * 4.5 + (ringI % 3) * 0.6;
   return new THREE.Vector3(
     Math.cos(theta) * Math.sin(phi) * r,
     Math.sin(theta) * Math.sin(phi) * r * 0.6,
@@ -505,6 +527,7 @@ function createAnglerfishNode(
     home: pos.clone(),
     diameter,
     fishYaw,
+    heat: heatFromQueryCount(company.queryCount),
   };
   group.userData = userData;
   return group;
@@ -776,13 +799,14 @@ export default function GraphCanvas({
         });
         u.bodyMat.uniforms.uTime.value = t;
         const pulse = 0.85 + 0.35 * Math.sin(t * 1.6 + u.bobPhase * 2);
+        const heat = u.heat;
         (u.bulbGlow.material as THREE.ShaderMaterial).uniforms.uIntensity.value =
-          pulse * w.glow * 1.4;
+          pulse * w.glow * 1.4 * heat;
         (u.halo.material as THREE.SpriteMaterial).opacity = Math.min(
           1,
-          (0.55 + 0.35 * pulse) * w.glow,
+          (0.55 + 0.35 * pulse) * w.glow * heat,
         );
-        u.light.intensity = pulse * 1.4 * w.glow;
+        u.light.intensity = pulse * 1.4 * w.glow * heat;
       });
 
       // edges (ribbon geometry + flowing-gradient shader + midpoint plaque)
@@ -800,6 +824,16 @@ export default function GraphCanvas({
         const a = eo.a.position;
         const b = eo.b.position;
         if (a.distanceToSquared(b) < 1e-6) return;
+        // Belt-and-suspenders: if either endpoint is non-finite (shouldn't
+        // happen anymore now that randSpherePosition is domain-safe, but a
+        // single tainted frame used to poison the bounding sphere forever),
+        // skip the edge for this frame rather than write NaN into the buffer.
+        if (
+          !Number.isFinite(a.x) || !Number.isFinite(a.y) || !Number.isFinite(a.z) ||
+          !Number.isFinite(b.x) || !Number.isFinite(b.y) || !Number.isFinite(b.z)
+        ) {
+          return;
+        }
 
         const mid = new THREE.Vector3().addVectors(a, b).multiplyScalar(0.5);
         const dir = new THREE.Vector3().subVectors(b, a);
@@ -978,6 +1012,15 @@ export default function GraphCanvas({
       el.innerHTML = `${c.name}${
         c.status !== "completed" ? ` <span class="st">· ${c.status}</span>` : ""
       }`;
+    });
+
+    // Refresh heat on existing nodes when switching into "All research" view
+    // — a company's queryCount might have gone from 1 to 5 without the node
+    // being recreated, and the heat factor is what the animate loop reads.
+    w.nodes.forEach((g, domain) => {
+      const c = companies[domain];
+      if (!c) return;
+      (g.userData as NodeUser).heat = heatFromQueryCount(c.queryCount);
     });
 
     // refresh raycast list

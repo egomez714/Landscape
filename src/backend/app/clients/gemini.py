@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-
+import logging
+from collections import Counter
+from typing import Literal
 from urllib.parse import urlparse
 
 from google import genai
@@ -24,8 +26,11 @@ from google.genai import errors as genai_errors
 from google.genai import types
 from pydantic import BaseModel, Field
 
+from app.clients.humandelta import AGGREGATOR_DOMAINS, EvidenceLine
 from app.config import settings
 from app.models import CompanyCandidate, Edge
+
+log = logging.getLogger(__name__)
 
 # Both tasks are cheap classification with strict structured output, so Flash-Lite is
 # sufficient for both. Plan originally called for Pro (extraction) + Flash (parsing),
@@ -43,40 +48,79 @@ class _CandidateList(BaseModel):
 
 
 EXTRACTION_PROMPT = """\
-You are a business-intelligence analyst extracting relationships between companies \
-for a knowledge graph. You must be extremely literal: ONLY use the evidence text \
-provided below; NEVER use your training knowledge.
+You are a business-intelligence analyst extracting relationships between two \
+companies for a knowledge graph. You must be extremely literal: ONLY use the \
+evidence text provided below; NEVER use your training knowledge.
 
-Source company: {source}
-Target company: {target}
+Company A: {a_name}
+Company B: {b_name}
 
-Evidence (lines from {source}'s indexed website that mention "{target}"):
-<<<EVIDENCE_START
-{evidence}
-EVIDENCE_END>>>
+Each evidence line is pre-tagged with the page it came from:
+  - [<page_type> | <url_path>] "text"
+Page types you will see: `compare`, `migrate`, `partner`, `integration`, \
+`customer`, `docs`, `blog`, `press`, `about`, `other`. Lines from aggregator \
+hosts (Hugging Face, Replicate, GitHub, npm, PyPI, Product Hunt, Wikipedia, \
+etc.) are additionally marked `aggregator` — those are THIRD-PARTY uploads \
+or listings, not statements from either company, and must not be the sole \
+basis of any classification.
 
-Task: classify the relationship from {source}'s perspective toward {target}.
+Evidence from {a_name}'s corpus (lines mentioning {b_name}):
+<<<EVIDENCE_A_START
+{evidence_a_to_b}
+EVIDENCE_A_END>>>
 
-Relationship types (pick exactly one):
-- "competitor": they serve the same customers with overlapping products
-- "partner": formal partnership, integration, co-marketing, or joint announcement
-- "investor": one invested in the other, or they share a named major investor
-- "downstream": {source} uses {target} as infrastructure or vice versa
-- "talent": documented hires / founders / executives moving between the two
-- "none": evidence is only a passing mention with no real relationship \
-(logos on a wall, keyword match, unrelated context)
+Evidence from {b_name}'s corpus (lines mentioning {a_name}):
+<<<EVIDENCE_B_START
+{evidence_b_to_a}
+EVIDENCE_B_END>>>
+
+Task: classify the relationship AND pick its direction.
+
+Relationship types:
+- "competitor": they serve overlapping customers / compete for the same \
+users. Examples: comparison pages (`compare`), migration pages (`migrate` — \
+"move off Y to X"), alternatives pages, "X vs Y".
+- "partner": formal partnership, integration, co-marketing, joint \
+announcement. Usually symmetric.
+- "uses": one company is built on the other as infrastructure or a technical \
+dependency, IN PRESENT TENSE — "we use X", "built on X", "powered by X", \
+"runs on X". Never pick this when the supporting evidence is a `compare` or \
+`migrate` page.
+- "customer": one side is a commercial customer of the other. Case studies, \
+testimonials, "trusted by" lists that include context.
+- "none": no real relationship visible — passing mentions, logo walls, \
+lists, keyword matches.
+
+Direction (pick exactly one):
+- "a_to_b": {a_name} is the subject — {a_name} uses/is-customer-of/etc. {b_name}.
+- "b_to_a": {b_name} is the subject.
+- "symmetric": the relationship is mutual — partnerships and competitors \
+almost always resolve here. Prefer "symmetric" for `partner`/`competitor` \
+unless the evidence clearly gives one side agency.
+
+PAGE-TYPE PRIORS (URL-path signal is stronger than sentence phrasing):
+- `[compare]` or `[migrate]`   → `competitor`. Never `uses`.
+- `[partner]` or `[integration]` → `partner` (or `uses` only if the sentence \
+  explicitly says built-on / powered-by).
+- `[customer]`                 → `customer`.
+- `[docs]` / `[blog]` / `[about]` / `[press]` / `[other]` → decide from the \
+  sentence; require explicit relationship language; default `none`.
 
 Strict rules:
-1. The `evidence_quote` MUST be an exact substring of the evidence above, \
-<=15 words, that supports your classification. Copy verbatim; no paraphrasing.
+1. The `evidence_quote` MUST be an exact substring of the text of one of the \
+evidence lines above, <=15 words. Copy verbatim; no paraphrasing.
 2. If you pick "none", set `evidence_quote` to "" and `confidence` to "low".
-3. A single mention of a company's name (e.g. in a logo wall) is NOT a partnership. \
-Require explicit relationship language: "partnership with", "integrates with", \
-"invested in", "powered by", "hired from", etc.
-4. Image filenames, URLs, and logo references (e.g. "logo.svg", "elastic-search.png", \
-"src=...", alt-text on images) are NEVER evidence of a relationship. If the only \
-evidence is a file URL or image reference, classify as "none".
-5. If uncertain, prefer "none" over guessing.
+3. A single name-drop in a logo wall, a list, or a ranking is NOT a \
+relationship — require explicit relationship language.
+4. Image filenames, URLs, src=, alt-text are NEVER evidence.
+5. If uncertain, prefer "none".
+6. AGGREGATOR RULE: if EVERY supporting evidence line is tagged \
+`aggregator`, return "none". Aggregator lines corroborate only — they are \
+never the primary basis for a `uses`/`partner`/`customer` claim.
+7. The direction must match the evidence that supports the quote. If the \
+quote is from A's corpus describing B as a dependency, pick `a_to_b` \
+(A uses B). If it's from a migrate page on A's corpus about moving off B, \
+that's `competitor` and `symmetric`.
 """
 
 QUERY_PARSER_PROMPT = """\
@@ -87,12 +131,34 @@ User query: "{query}"
 Return 8-12 specific, well-known companies that match this query. For each, provide \
 its display name and its homepage URL (starting with https://www.). Prefer companies \
 with public blogs or docs that can be crawled. Skip vaporware and defunct companies.
+
+Name rules:
+- Use the canonical company name, not a sub-product or service line (e.g. "AWS", \
+not "AWS AI Services"; "OpenAI", not "ChatGPT"). Sub-product names cause the graph \
+to have two nodes that resolve to the same corpus.
+- Prefer the name whose first token matches a label in the homepage domain \
+(e.g. "Replicate" for replicate.com, "Anthropic" for anthropic.com).
+
+URL rules:
+- Homepage must be the company's own canonical domain, not an aggregator, \
+marketplace, code host, or social platform. Never return GitHub org pages \
+(github.com/<org>), Hugging Face profiles (huggingface.co/<org>), npm/PyPI \
+pages, Product Hunt, Crunchbase, LinkedIn, Twitter/X, YouTube, Medium, or \
+Wikipedia as a company's homepage — those are hosting/listing venues, not \
+companies. If the company only publishes via such a venue, skip it.
+
+If the query names a single person, product, or technology rather than an industry \
+(e.g. "Sam Altman", "ChatGPT", "Kubernetes", "Rust"), infer the most likely industry \
+from context and return the companies operating in THAT industry — never return the \
+person as a company, and never return only the single product's maker. Examples: \
+"Sam Altman" → AI labs (OpenAI, Anthropic, Google DeepMind, xAI, Mistral, …). \
+"ChatGPT" → chatbot/assistant companies (OpenAI, Anthropic, Google, Perplexity, …). \
+"Kubernetes" → cloud-native infra companies (Docker, Red Hat, Rancher, Platform9, …).
 """
 
 SUMMARY_PROMPT = """\
-Summarize what {company} does in ONE sentence, at most 20 words. Write it for a job \
-seeker researching this company — say what they build and who their customers are. \
-Use only the text below; do not invent facts.
+Summarize what {company} does in ONE sentence, at most 20 words. Say what they \
+build and who their customers are. Use only the text below; do not invent facts.
 
 Text from their website:
 <<<
@@ -102,25 +168,47 @@ Text from their website:
 
 EXPANSION_PROMPT = """\
 You are analyzing text from {company}'s website. List other *independent companies* \
-mentioned in the text that the reader could click through to research separately.
+mentioned in the text, and CLASSIFY each one.
 
-For each one, return:
-  - name: the company name as it appears in the text
-  - evidence_quote: an exact quote from the text (<=20 words) that mentions this \
+For each candidate, return:
+  - name: the company name as it appears in the text.
+  - evidence_quote: an exact quote (<=20 words) from the text that mentions the \
 company. MUST be a literal substring of the text below — no paraphrasing.
   - homepage_url: the company's own homepage URL (with scheme, e.g. \
 "https://www.openai.com"). REQUIRED. If you don't know it or it doesn't appear in \
 the text, omit the candidate entirely — do not guess, do not return null.
+  - category: one of the labels below. Choose the BEST fit. If genuinely ambiguous, \
+use "unclear" rather than forcing a category — we'll include it anyway.
+
+Category rules (pick exactly one):
+  - "peer": direct competitors or adjacent companies the reader would research \
+together with {company}. Example: for Anthropic → OpenAI, Cohere, Mistral.
+  - "integration_partner": companies with a named formal integration or joint \
+product. Example: LangChain ↔ MongoDB partnership.
+  - "customer": a company that USES {company}'s product. Example: Notion uses \
+Anthropic's models.
+  - "investor": a VC firm or strategic backer named as such. Example: Spark Capital.
+  - "infrastructure": cloud/db/tooling that {company} BUILDS ON. Example: for \
+Anthropic → AWS Bedrock, GCP. These are NOT peers.
+  - "distribution_channel": social media, app stores, podcasts, content platforms, \
+code hosting. Examples: YouTube, Twitter/X, LinkedIn, GitHub, Product Hunt, \
+Hacker News, TikTok, Discord. These are venues where content is POSTED, not \
+companies worth researching as peers. Always REJECTED by default downstream.
+  - "event_venue": conferences, convention centers, event series. Examples: \
+Excel London, Moscone Center, NeurIPS, Web Summit. Always REJECTED by default.
+  - "unclear": genuinely ambiguous — the text mentions the name but you can't \
+tell what the relationship is. Use sparingly; better than forcing a wrong label.
 
 Hard rules:
 1. Only INDEPENDENT companies. Reject sub-products, services, or sub-brands of \
-{company} itself (e.g. if the source is "Amazon", do NOT return "AWS", "AWS Lambda", \
-"Prime Video"; if the source is "OpenAI", do NOT return "ChatGPT" or "GPT-4").
+{company} itself (e.g. if source is "Amazon", do NOT return "AWS", "AWS Lambda"; \
+if source is "OpenAI", do NOT return "ChatGPT" or "GPT-4").
 2. Ignore generic technology categories and common nouns (AI, API, ML, LLM, Cloud, \
-Database, Vector Search, Vector Database, Platform, SaaS, Infrastructure, SDK, \
-Framework, Open Source, etc.).
+Database, Vector Search, Platform, SaaS, Infrastructure, SDK, Framework, Open \
+Source, etc.).
 3. Prefer proper nouns — real company names, not product categories.
-4. Return at most 10 candidates. Fewer is fine if you can't find 10 good ones.
+4. Return at most 12 candidates. Fewer is fine. Prefer peer and integration_partner \
+candidates if you have to choose.
 5. Skip anything in this exclusion list (case-insensitive): {exclusions}
 
 Text from {company}'s website:
@@ -142,10 +230,36 @@ GENERIC_EXCLUDES: frozenset[str] = frozenset({
 })
 
 
+ExpansionCategory = Literal[
+    "peer",
+    "integration_partner",
+    "customer",
+    "investor",
+    "infrastructure",
+    "distribution_channel",
+    "event_venue",
+    "unclear",
+]
+
+# Two-pass filter for "find more like this". Strict pass keeps peers + integration
+# partners (the common interpretation) plus `unclear` (safety net for the LLM's
+# own uncertainty). If that returns zero, we relax to also include customers +
+# investors + infrastructure — still grounded, just a wider net. The truly useless
+# categories (distribution_channel, event_venue) are ALWAYS dropped.
+_STRICT_ACCEPTED_CATEGORIES: frozenset[str] = frozenset({
+    "peer", "integration_partner", "unclear",
+})
+_RELAXED_ACCEPTED_CATEGORIES: frozenset[str] = frozenset({
+    "peer", "integration_partner", "unclear",
+    "customer", "investor", "infrastructure",
+})
+
+
 class _ExpansionCandidate(BaseModel):
     name: str
     evidence_quote: str
     homepage_url: str | None = None
+    category: ExpansionCategory = "unclear"
 
 
 class _ExpansionCandidateList(BaseModel):
@@ -175,32 +289,49 @@ class GeminiClient:
             ),
         )
         parsed = _CandidateList(**json.loads(resp.text))
-        # Deduplicate by domain in case the model returns near-duplicates.
-        seen: set[str] = set()
-        uniq: list[CompanyCandidate] = []
-        for c in parsed.companies:
-            if c.domain and c.domain not in seen:
-                seen.add(c.domain)
-                uniq.append(c)
-        return uniq
+        # Two filters + a canonical-name pick:
+        #   1. Drop aggregator / marketplace / social sites — they don't belong
+        #      as authoritative corpus sources. A DeepSeek node at
+        #      github.com/deepseek-ai produced wrong-direction edges because the
+        #      crawled corpus was actually NVIDIA's + chenxwh's uploads, not
+        #      DeepSeek's. Better to skip than to mislead.
+        #   2. Group by full domain and pick the most canonical name. Gemini
+        #      returned both "AWS" and "AWS AI Services" at aws.amazon.com; the
+        #      second got added, then Find More proposed AWS, and the frontend
+        #      silently dropped it as a duplicate-domain. Picking "AWS" (the
+        #      canonical name matching the domain's root label) up-front
+        #      prevents that UX dead end.
+        filtered = [c for c in parsed.companies if _is_usable_candidate(c)]
+        by_domain: dict[str, list[CompanyCandidate]] = {}
+        for c in filtered:
+            by_domain.setdefault(c.domain, []).append(c)
+        return [
+            min(group, key=_canonicality_score)
+            for group in by_domain.values()
+        ]
 
     # ---- relationship extraction ----
 
     async def extract_relationship(
         self,
         *,
-        source_name: str,
-        target_name: str,
-        evidence: list[str],
+        a_name: str,
+        b_name: str,
+        evidence_a_to_b: list[EvidenceLine],
+        evidence_b_to_a: list[EvidenceLine],
     ) -> Edge | None:
-        """Run one extraction call. Returns None if the model hallucinated the quote."""
-        if not evidence:
+        """Run one extraction call with BOTH directions' evidence. The LLM picks
+        the direction itself from the structural signals on each line (page_type
+        and url_path). Returns None if the model hallucinated the quote.
+        """
+        if not evidence_a_to_b and not evidence_b_to_a:
             return None
 
         prompt = EXTRACTION_PROMPT.format(
-            source=source_name,
-            target=target_name,
-            evidence="\n".join(f"- {ln}" for ln in evidence),
+            a_name=a_name,
+            b_name=b_name,
+            evidence_a_to_b=_format_evidence_block(evidence_a_to_b),
+            evidence_b_to_a=_format_evidence_block(evidence_b_to_a),
         )
         try:
             resp = await asyncio.to_thread(
@@ -219,9 +350,14 @@ class GeminiClient:
 
         data = json.loads(resp.text)
         edge = Edge(**data)
-        # Post-validate: evidence_quote must be a literal substring of the evidence.
+        # Post-validate: evidence_quote must be a literal substring of one of
+        # the provided lines, across either direction. Substring check mirrors
+        # the same correctness gate as before — it's the single cheapest
+        # anti-hallucination control we have.
         if edge.type != "none":
-            haystack = " || ".join(evidence).lower()
+            haystack = " || ".join(
+                e.text for e in (*evidence_a_to_b, *evidence_b_to_a)
+            ).lower()
             if edge.evidence_quote.lower() not in haystack:
                 return None
         return edge
@@ -246,10 +382,13 @@ class GeminiClient:
             return []
 
         exclusion_list_str = ", ".join(sorted({e for e in exclusions if e})) or "(none)"
+        # In-prompt cap matches what the caller actually fetched (24 KB). Flash-Lite
+        # handles ~6K tokens trivially, and cutting earlier wastes the extra HD
+        # bytes we already paid for in expand_from_node's summarize_page call.
         prompt = EXPANSION_PROMPT.format(
             company=source_company,
             exclusions=exclusion_list_str,
-            content=corpus_text[:12000],  # cap prompt size
+            content=corpus_text[:24000],
         )
         try:
             resp = await asyncio.to_thread(
@@ -273,19 +412,30 @@ class GeminiClient:
         # those are sub-products of the source company, not independent entities.
         source_root = _root_domain_from_name(source_company, exclusions)
 
-        kept: list[_ExpansionCandidate] = []
+        # Telemetry: log the pre-filter category distribution so we can tune
+        # the accepted set from real data instead of guessing.
+        raw_category_counts = Counter(
+            (c.category or "unclear") for c in parsed.candidates
+        )
+        log.info(
+            "expansion candidates for %s: %d raw, by category %s",
+            source_company, len(parsed.candidates), dict(raw_category_counts),
+        )
+
+        # First pass: filter out everything except the safe/unambiguous core.
+        # Every other non-category check is independent of category (substring
+        # validation, generic excludes, homepage URL, same-root rejection) so we
+        # compute a single pre-filtered pool then choose a category-accept set.
+        prefiltered: list[_ExpansionCandidate] = []
         seen_names: set[str] = set()
         for c in parsed.candidates:
             name_l = c.name.lower().strip()
             if not name_l or name_l in seen_names:
                 continue
-            # Substring validation — same rule as edge extraction.
             if c.evidence_quote.lower().strip() not in haystack:
                 continue
-            # Reject exclusions + generic terms.
             if name_l in exclusion_names or name_l in GENERIC_EXCLUDES:
                 continue
-            # Reject short lowercase common words slipping through as proper nouns.
             if (
                 name_l.isalpha()
                 and name_l == name_l.lower()
@@ -293,18 +443,39 @@ class GeminiClient:
                 and len(name_l) < 4
             ):
                 continue
-            # Must have a usable, parseable homepage URL.
             normalized_url = _normalize_url(c.homepage_url)
             if not normalized_url:
                 continue
             c = c.model_copy(update={"homepage_url": normalized_url})
-            # Reject sub-products: same root domain as the source.
             candidate_root = _root_domain(normalized_url)
             if candidate_root and source_root and candidate_root == source_root:
                 continue
-            kept.append(c)
+            # distribution_channel and event_venue are *always* dropped — these
+            # are footers/logos/event names, never what the user wants.
+            if c.category in {"distribution_channel", "event_venue"}:
+                continue
+            prefiltered.append(c)
             seen_names.add(name_l)
-        return kept
+
+        # Strict pass: peer + integration_partner + unclear only.
+        strict = [c for c in prefiltered if c.category in _STRICT_ACCEPTED_CATEGORIES]
+        if strict:
+            log.info(
+                "expansion for %s: %d strict candidates (categories: %s)",
+                source_company, len(strict),
+                dict(Counter(c.category for c in strict)),
+            )
+            return strict
+
+        # Fallback: relax to include customer + investor + infrastructure.
+        # Same grounding, wider net — better than returning empty.
+        relaxed = [c for c in prefiltered if c.category in _RELAXED_ACCEPTED_CATEGORIES]
+        log.info(
+            "expansion for %s: strict empty, relaxed returned %d (categories: %s)",
+            source_company, len(relaxed),
+            dict(Counter(c.category for c in relaxed)),
+        )
+        return relaxed
 
     # ---- company summary ----
 
@@ -326,6 +497,54 @@ class GeminiClient:
         except genai_errors.ClientError:
             return ""
         return (resp.text or "").strip()
+
+
+def _format_evidence_block(lines: list[EvidenceLine]) -> str:
+    """Render EvidenceLines as the tagged list the extraction prompt consumes.
+
+    Each line becomes:
+      - [<page_type> | <url_path>] "<text>"
+    with an `aggregator ` prefix on page_type if the line originates from a
+    third-party-upload host. An empty list renders as "(no evidence)" so the
+    LLM sees a deterministic placeholder rather than a blank.
+    """
+    if not lines:
+        return "(no evidence)"
+    out: list[str] = []
+    for ln in lines:
+        pt = ("aggregator " + ln.page_type) if ln.is_aggregator else ln.page_type
+        path = ln.url_path or "/"
+        out.append(f'- [{pt} | {path}] "{ln.text}"')
+    return "\n".join(out)
+
+
+def _is_usable_candidate(c: CompanyCandidate) -> bool:
+    """Reject parse_query candidates that aren't really companies — aggregator
+    sites, code hosts, marketplaces. These produce wrong-direction edges
+    because their corpus is other people's content, not the platform's own.
+    """
+    dom = (c.domain or "").lower()
+    if not dom:
+        return False
+    if dom in AGGREGATOR_DOMAINS:
+        return False
+    # Catch subdomains of aggregators too: `blog.github.com`, `chenxwh.huggingface.co`.
+    root = _root_domain(f"https://{dom}")
+    if root and root in AGGREGATOR_DOMAINS:
+        return False
+    return True
+
+
+def _canonicality_score(c: CompanyCandidate) -> tuple[int, int]:
+    """Lower is better. Used to pick the best name when Gemini returns multiple
+    candidates at the same domain (e.g. "AWS" and "AWS AI Services" at
+    aws.amazon.com). Prefer names whose first token matches a domain label,
+    then the shorter name.
+    """
+    name_first = c.name.split()[0].lower() if c.name else ""
+    labels = {lbl for lbl in (c.domain or "").split(".") if lbl}
+    matches = 0 if name_first in labels else 1
+    return (matches, len(c.name))
 
 
 def _normalize_url(url: str | None) -> str | None:

@@ -22,7 +22,13 @@ export type CompanyNode = CompanyRef & {
   pageCount?: number;
   failReason?: string;
   indexId?: string; // needed to fetch the company summary
+  // Number of distinct queries that have surfaced this company. Set to 1 for
+  // live nodes from the current query; in "All research" view this is the
+  // accumulated count from IndexedDB and drives node-heat scaling.
+  queryCount?: number;
 };
+
+export type ViewMode = "current" | "all";
 
 export type EvidenceSnippet = {
   text: string;

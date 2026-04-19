@@ -50,6 +50,8 @@ async def _index_one(
     timeout_seconds: float,
     use_cache: bool,
 ) -> None:
+    # Default timeout is bumped up (240s) in index_all — some heavy corporate sites
+    # (replicate.com, agilent.com) legitimately take 3+ minutes to crawl.
     # Cache hit → skip crawl, go straight to completed event.
     if use_cache:
         cached = await index_cache.get(hd, company.domain)
@@ -115,9 +117,9 @@ async def index_all(
     hd: HumanDeltaClient,
     companies: list[CompanyCandidate],
     *,
-    concurrency: int = 6,
+    concurrency: int = 4,
     max_pages: int = 20,
-    timeout_seconds: float = 180.0,
+    timeout_seconds: float = 240.0,
     use_cache: bool = True,
 ) -> AsyncIterator[IndexEvent]:
     """Fan out indexing across all companies, yield events as they arrive."""

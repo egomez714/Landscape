@@ -22,18 +22,20 @@ helpers so staleness and crawl-version semantics from Feature 1 keep working.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import shlex
 from itertools import combinations
 from typing import AsyncIterator
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from app.clients.gemini import GeminiClient
-from app.clients.humandelta import HumanDeltaClient
+from app.clients.humandelta import HumanDeltaClient, vfs_path_to_url
 from app.models import CompanyCandidate, IndexedCompany
 from app.services import edge_persist, temporal_store
 from app.services.extractor import EdgeFoundEvent, PairSkippedEvent, extract_graph
@@ -50,11 +52,18 @@ router = APIRouter()
 
 # ---- /v1/expand_from_node ---------------------------------------------------
 
+class ExistingNode(BaseModel):
+    """One company already in the graph. The frontend must pass *both* name
+    and domain so we can (a) feed names to Gemini as exclusions and (b) detect
+    candidate↔existing domain collisions and flag them for the UI."""
+    name: str
+    domain: str
+
+
 class ExpandFromNodeRequest(BaseModel):
     source_domain: str
     source_index_id: str
-    # Names (or domains) currently in the graph — we won't propose any of these.
-    exclusions: list[str] = Field(default_factory=list)
+    existing_nodes: list[ExistingNode] = Field(default_factory=list)
 
 
 class ExpandCandidateOut(BaseModel):
@@ -62,10 +71,38 @@ class ExpandCandidateOut(BaseModel):
     evidence_quote: str
     source_url: str
     homepage_url: str | None = None
+    # Filled when the candidate's homepage domain equals an existing node's
+    # domain (e.g. Gemini suggested "AWS" when "AWS AI Services" is already
+    # indexed at aws.amazon.com). The UI disables the checkbox and shows
+    # "already in graph as <collides_with>" so the user doesn't watch a node
+    # silently vanish after selecting it.
+    collides_with: str | None = None
 
 
 class ExpandFromNodeResponse(BaseModel):
     candidates: list[ExpandCandidateOut]
+
+
+def _collision_name(
+    homepage_url: str | None,
+    domain_to_existing_name: dict[str, str],
+) -> str | None:
+    """If the candidate's homepage domain matches a node already in the graph,
+    return that node's display name so the UI can disable the checkbox and
+    explain *why* the candidate can't be added again. Mirrors the stripping of
+    "www." that CompanyCandidate.domain does, so "https://www.aws.amazon.com"
+    and "aws.amazon.com" compare equal.
+    """
+    if not homepage_url:
+        return None
+    try:
+        host = urlparse(homepage_url).hostname or ""
+    except ValueError:
+        return None
+    host = host.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return domain_to_existing_name.get(host)
 
 
 async def _resolve_quote_source_url(
@@ -78,6 +115,9 @@ async def _resolve_quote_source_url(
 
     Uses a distinctive snippet (first 40 chars) to minimize false matches.
     Returns None if grep finds no file — caller falls back to the domain root.
+    Delegates the path→URL conversion to vfs_path_to_url so subdomain-keyed
+    indexes (docs.anthropic.com, blog.google.com, cloud.google.com) build
+    correctly instead of becoming https://www.docs.anthropic.com/...
     """
     snippet = quote.strip()[:40]
     if not snippet:
@@ -91,13 +131,7 @@ async def _resolve_quote_source_url(
     if not stdout:
         return None
     path = stdout.splitlines()[0]
-    prefix = f"/source/website/{domain}/"
-    if not path.startswith(prefix):
-        return None
-    tail = path[len(prefix):]
-    if tail.endswith(".md"):
-        tail = tail[:-3]
-    return f"https://www.{domain}/{tail}".rstrip("/")
+    return vfs_path_to_url(path, f"https://{domain}")
 
 
 @router.post("/v1/expand_from_node", response_model=ExpandFromNodeResponse)
@@ -109,7 +143,8 @@ async def expand_from_node(req: ExpandFromNodeRequest) -> ExpandFromNodeResponse
         corpus = await hd.summarize_page(
             index_id=req.source_index_id,
             source_domain=req.source_domain,
-            max_bytes=12_000,
+            max_bytes=24_000,
+            max_files=10,
         )
         if not corpus:
             raise HTTPException(
@@ -118,25 +153,42 @@ async def expand_from_node(req: ExpandFromNodeRequest) -> ExpandFromNodeResponse
             )
 
         source_name_guess = req.source_domain.split(".")[0].capitalize()
+        existing_names = [n.name for n in req.existing_nodes]
+        domain_to_existing_name = {n.domain: n.name for n in req.existing_nodes}
         # Ensure the source company itself is never proposed. Include the domain
         # so the "same root" filter in suggest_expansion_candidates can use it.
-        exclusions = list(req.exclusions) + [source_name_guess, req.source_domain]
+        exclusions = existing_names + [source_name_guess, req.source_domain]
         gemini_candidates = await gemini.suggest_expansion_candidates(
             source_company=source_name_guess,
             exclusions=exclusions,
             corpus_text=corpus,
         )
 
+        # Resolve each candidate's per-page source URL in parallel. Each resolver
+        # issues one /v1/fs grep; at 300-500ms/call, serial was the dominant
+        # latency term (N × ~400ms). return_exceptions=True keeps one flaky grep
+        # from failing the whole modal — that candidate just falls back to the
+        # domain-root URL.
+        resolved = await asyncio.gather(
+            *(
+                _resolve_quote_source_url(
+                    hd, req.source_domain, req.source_index_id, c.evidence_quote,
+                )
+                for c in gemini_candidates
+            ),
+            return_exceptions=True,
+        )
         out: list[ExpandCandidateOut] = []
-        for c in gemini_candidates:
-            source_url = await _resolve_quote_source_url(
-                hd, req.source_domain, req.source_index_id, c.evidence_quote,
-            )
+        for c, url in zip(gemini_candidates, resolved):
+            resolved_url = url if isinstance(url, str) else None
             out.append(ExpandCandidateOut(
                 name=c.name,
                 evidence_quote=c.evidence_quote,
-                source_url=source_url or f"https://www.{req.source_domain}",
+                source_url=resolved_url or f"https://{req.source_domain}",
                 homepage_url=c.homepage_url,
+                collides_with=_collision_name(
+                    c.homepage_url, domain_to_existing_name,
+                ),
             ))
         return ExpandFromNodeResponse(candidates=out)
     finally:

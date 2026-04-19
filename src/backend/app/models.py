@@ -8,9 +8,15 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, Field, field_validator
 
 RelationshipType = Literal[
-    "competitor", "partner", "investor", "downstream", "talent", "none",
+    "competitor", "partner", "uses", "customer", "none",
 ]
 Confidence = Literal["high", "medium", "low"]
+
+# Direction of the extracted edge relative to the (A, B) pair passed into the
+# LLM. Asymmetric types (`uses`, `customer`) force the model to pick a_to_b or
+# b_to_a; symmetric types (`partner`, `competitor`) usually resolve to
+# `symmetric`. Used to map back onto source/target when building a GraphEdge.
+Direction = Literal["a_to_b", "b_to_a", "symmetric"]
 
 
 class CompanyCandidate(BaseModel):
@@ -34,11 +40,24 @@ class IndexedCompany(BaseModel):
 
 
 class Edge(BaseModel):
-    """Output of the relationship extractor for one (source, target) pair."""
+    """Output of the relationship extractor for one (A, B) pair.
+
+    The LLM sees evidence from *both* corpora and picks a `direction` along
+    with the `type`. Callers map this back to source/target on the emitted
+    GraphEdge. Earlier versions had the extractor pick direction by evidence
+    line count alone, which collapsed to the wrong direction whenever one
+    corpus was larger — that heuristic is now the model's job, informed by
+    per-line page-type tags."""
     type: RelationshipType
+    direction: Direction = Field(
+        default="a_to_b",
+        description="Direction of the relationship relative to the (A, B) pair "
+                    "passed in. Use 'symmetric' for partnerships/competitors "
+                    "unless the evidence clearly points one way.",
+    )
     evidence_quote: str = Field(
-        description="Verbatim substring of the provided evidence, <=15 words. "
-                    "Empty string only when type='none'.",
+        description="Verbatim substring of one of the provided evidence lines, "
+                    "<=15 words. Empty string only when type='none'.",
     )
     confidence: Confidence
 
