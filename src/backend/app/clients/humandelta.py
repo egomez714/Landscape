@@ -18,12 +18,21 @@ import re
 import shlex
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
 from app.config import settings
 
 TERMINAL_STATUSES = {"completed", "failed"}
+
+# Evidence lines are almost never useful when they're a wrapper around an image file
+# (logo walls, next/image srcs, <img> tags). We drop them before sending to Gemini;
+# the LLM otherwise tends to pattern-match a logo co-location as a "partnership".
+_IMAGE_URL_RE = re.compile(
+    r"(?:\w[\w\-]*\.(?:svg|png|jpg|jpeg|webp|gif|avif)\b)|!\[|<img|src=[\"']",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -33,6 +42,28 @@ class IndexStatus:
     page_count: int | None
     error_message: str | None
     seed_urls: list[str]
+
+
+@dataclass(frozen=True)
+class EvidenceLine:
+    """A single grep match with its VFS-derived source URL."""
+    text: str
+    source_url: str
+
+
+def _vfs_path_to_url(vfs_path: str, base_url: str) -> str:
+    """Convert /source/website/<domain>/path/to/page.md → https://<netloc>/path/to/page."""
+    prefix = "/source/website/"
+    if not vfs_path.startswith(prefix):
+        return base_url
+    after_prefix = vfs_path[len(prefix):]
+    _, _, subpath = after_prefix.partition("/")
+    if subpath.endswith(".md"):
+        subpath = subpath[:-3]
+    parsed = urlparse(base_url)
+    scheme = parsed.scheme or "https"
+    netloc = parsed.netloc or parsed.path.strip("/")
+    return f"{scheme}://{netloc}/{subpath}".rstrip("/")
 
 
 class HumanDeltaClient:
@@ -138,32 +169,69 @@ class HumanDeltaClient:
         *,
         source_index_id: str,
         source_domain: str,
+        source_base_url: str,
         target_name: str,
         max_lines: int = 12,
         max_chars_per_line: int = 320,
-    ) -> list[str]:
-        """Grep source's VFS for target's name. Returns up to max_lines deduped evidence lines.
+    ) -> list[EvidenceLine]:
+        """Grep source's VFS for target's name. Returns up to max_lines deduped
+        evidence lines, each carrying the URL of the page it was found on.
 
-        Drops obvious noise (markdown image tags, bare URLs) before returning.
+        Drops image-URL / logo-wall noise before returning.
         """
         pattern = rf"\b{re.escape(target_name)}\b"
         vfs = f"/source/website/{source_domain}"
+        # Drop -h so grep emits "filename:line" — we need the filename to build a source URL.
         cmd = (
-            f"grep -rhiE --include='*.md' {shlex.quote(pattern)} {vfs} "
-            f"| head -n {max_lines * 2}"   # over-fetch to survive filter
+            f"grep -riE --include='*.md' {shlex.quote(pattern)} {vfs} "
+            f"| head -n {max_lines * 3}"
         )
         res = await self.fs(index_id=source_index_id, cmd=cmd)
         raw = res.get("stdout") or ""
-        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-        lines = [ln for ln in lines if not ln.startswith("![") and not ln.startswith("http")]
-        lines = [ln[:max_chars_per_line] for ln in lines]
 
-        seen: set[str] = set()
-        uniq: list[str] = []
-        for ln in lines:
-            if ln not in seen:
-                seen.add(ln)
-                uniq.append(ln)
-            if len(uniq) >= max_lines:
+        out: list[EvidenceLine] = []
+        seen_texts: set[str] = set()
+        for ln in raw.splitlines():
+            if not ln.strip():
+                continue
+            file_path, sep, text = ln.partition(":")
+            if not sep:
+                continue
+            text = text.strip()
+            if not text:
+                continue
+            if text.startswith("![") or text.startswith("http"):
+                continue
+            if _IMAGE_URL_RE.search(text):
+                continue
+            text = text[:max_chars_per_line]
+            if text in seen_texts:
+                continue
+            seen_texts.add(text)
+            out.append(EvidenceLine(
+                text=text,
+                source_url=_vfs_path_to_url(file_path, source_base_url),
+            ))
+            if len(out) >= max_lines:
                 break
-        return uniq
+        return out
+
+    async def summarize_page(
+        self,
+        *,
+        index_id: str,
+        source_domain: str,
+        max_bytes: int = 4000,
+    ) -> str:
+        """Return up to max_bytes of text from the first few .md pages in the VFS.
+
+        Used by GeminiClient.summarize_company to get raw text for a one-sentence summary.
+        """
+        vfs = f"/source/website/{source_domain}"
+        cmd = (
+            f"find {vfs} -maxdepth 3 -name '*.md' -print 2>/dev/null "
+            f"| head -n 3 | xargs -I {{}} cat {{}} 2>/dev/null "
+            f"| head -c {max_bytes}"
+        )
+        res = await self.fs(index_id=index_id, cmd=cmd)
+        return (res.get("stdout") or "").strip()

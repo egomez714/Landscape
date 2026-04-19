@@ -20,8 +20,8 @@ from itertools import combinations
 from typing import AsyncIterator
 
 from app.clients.gemini import GeminiClient
-from app.clients.humandelta import HumanDeltaClient
-from app.models import GraphEdge, IndexedCompany
+from app.clients.humandelta import EvidenceLine, HumanDeltaClient
+from app.models import EvidenceSnippet, GraphEdge, IndexedCompany
 
 log = logging.getLogger(__name__)
 
@@ -50,12 +50,17 @@ async def _extract_pair(
     # Gather evidence from BOTH corpora; stronger signal than one-directional.
     ev_ab, ev_ba = await asyncio.gather(
         hd.find_cooccurrences(
-            source_index_id=a.index_id, source_domain=a.domain, target_name=b.name,
+            source_index_id=a.index_id,
+            source_domain=a.domain,
+            source_base_url=a.url,
+            target_name=b.name,
         ),
         hd.find_cooccurrences(
-            source_index_id=b.index_id, source_domain=b.domain, target_name=a.name,
+            source_index_id=b.index_id,
+            source_domain=b.domain,
+            source_base_url=b.url,
+            target_name=a.name,
         ),
-        return_exceptions=False,
     )
     # Pick the source direction with more evidence; that's the one we query Gemini on.
     if len(ev_ab) >= len(ev_ba):
@@ -66,24 +71,52 @@ async def _extract_pair(
     if not evidence:
         return PairSkippedEvent(source=a.name, target=b.name, reason="no_evidence")
 
+    # Gemini sees only the text; URLs stay on our side.
     edge = await gemini.extract_relationship(
-        source_name=src.name, target_name=tgt.name, evidence=evidence,
+        source_name=src.name,
+        target_name=tgt.name,
+        evidence=[e.text for e in evidence],
     )
     if edge is None:
         return PairSkippedEvent(
-            source=a.name, target=b.name,
-            reason="error_or_hallucinated",
+            source=a.name, target=b.name, reason="error_or_hallucinated",
         )
     if edge.type == "none":
         return PairSkippedEvent(source=a.name, target=b.name, reason="none_classification")
 
+    snippets = _build_evidence_snippets(edge.evidence_quote, evidence)
     return EdgeFoundEvent(edge=GraphEdge(
         source=src.name,
         target=tgt.name,
         type=edge.type,
-        evidence_quote=edge.evidence_quote,
         confidence=edge.confidence,
+        evidence=snippets,
     ))
+
+
+def _build_evidence_snippets(
+    primary_quote: str,
+    evidence: list[EvidenceLine],
+    max_total: int = 3,
+) -> list[EvidenceSnippet]:
+    """Return up to `max_total` snippets. First matches the LLM's chosen quote; rest
+    are the other grep lines, in order, for context."""
+    pq = primary_quote.lower().strip()
+    # Find the grep line that the LLM's quote came from — substring match, first wins.
+    primary_idx = next(
+        (i for i, e in enumerate(evidence) if pq and pq in e.text.lower()),
+        None,
+    )
+    ordered: list[EvidenceLine] = []
+    if primary_idx is not None:
+        ordered.append(evidence[primary_idx])
+        ordered.extend(e for i, e in enumerate(evidence) if i != primary_idx)
+    else:
+        ordered = list(evidence)
+    return [
+        EvidenceSnippet(text=e.text, source_url=e.source_url)
+        for e in ordered[:max_total]
+    ]
 
 
 async def extract_graph(
