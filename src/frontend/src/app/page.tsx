@@ -168,7 +168,7 @@ export default function Home() {
                 animation: "abyss-pulse 2.6s ease-in-out infinite",
               }}
             />
-            Landscape
+            Fathom
           </div>
           <div className="font-mono text-[10.5px] uppercase tracking-[0.22em] text-[var(--fg-faint)]">
             Knowledge graph · Abyssal zone · −3,280 m

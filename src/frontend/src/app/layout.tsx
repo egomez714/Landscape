@@ -22,7 +22,7 @@ const fraunces = Fraunces({
 });
 
 export const metadata: Metadata = {
-  title: "Landscape — Abyssal Survey",
+  title: "Fathom — Abyssal Survey",
   description: "Map any industry into a live, grounded knowledge graph.",
 };
 
