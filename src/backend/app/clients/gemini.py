@@ -17,6 +17,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+from urllib.parse import urlparse
+
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
@@ -98,6 +100,57 @@ Text from their website:
 >>>
 """
 
+EXPANSION_PROMPT = """\
+You are analyzing text from {company}'s website. List other *independent companies* \
+mentioned in the text that the reader could click through to research separately.
+
+For each one, return:
+  - name: the company name as it appears in the text
+  - evidence_quote: an exact quote from the text (<=20 words) that mentions this \
+company. MUST be a literal substring of the text below — no paraphrasing.
+  - homepage_url: the company's own homepage URL (with scheme, e.g. \
+"https://www.openai.com"). REQUIRED. If you don't know it or it doesn't appear in \
+the text, omit the candidate entirely — do not guess, do not return null.
+
+Hard rules:
+1. Only INDEPENDENT companies. Reject sub-products, services, or sub-brands of \
+{company} itself (e.g. if the source is "Amazon", do NOT return "AWS", "AWS Lambda", \
+"Prime Video"; if the source is "OpenAI", do NOT return "ChatGPT" or "GPT-4").
+2. Ignore generic technology categories and common nouns (AI, API, ML, LLM, Cloud, \
+Database, Vector Search, Vector Database, Platform, SaaS, Infrastructure, SDK, \
+Framework, Open Source, etc.).
+3. Prefer proper nouns — real company names, not product categories.
+4. Return at most 10 candidates. Fewer is fine if you can't find 10 good ones.
+5. Skip anything in this exclusion list (case-insensitive): {exclusions}
+
+Text from {company}'s website:
+<<<
+{content}
+>>>
+"""
+
+# Additional rejection list applied after the LLM returns — covers common generic
+# terms that still sneak through the prompt. Case-insensitive match.
+GENERIC_EXCLUDES: frozenset[str] = frozenset({
+    "ai", "api", "ml", "llm", "llms", "aiml", "cloud", "vector", "vectors",
+    "vector search", "vector database", "vector databases", "database", "databases",
+    "platform", "platforms", "data", "infrastructure", "sdk", "tool", "tools",
+    "service", "services", "search", "inference", "embedding", "embeddings",
+    "neural", "model", "models", "framework", "frameworks", "open source", "oss",
+    "saas", "startup", "startups", "company", "companies", "product", "products",
+    "software", "app", "apps", "enterprise", "customer", "customers", "user", "users",
+})
+
+
+class _ExpansionCandidate(BaseModel):
+    name: str
+    evidence_quote: str
+    homepage_url: str | None = None
+
+
+class _ExpansionCandidateList(BaseModel):
+    candidates: list[_ExpansionCandidate] = Field(default_factory=list)
+
 
 class GeminiClient:
     def __init__(self, api_key: str | None = None) -> None:
@@ -173,6 +226,86 @@ class GeminiClient:
                 return None
         return edge
 
+    # ---- expansion (Feature 2) ----
+
+    async def suggest_expansion_candidates(
+        self,
+        *,
+        source_company: str,
+        exclusions: list[str],
+        corpus_text: str,
+    ) -> list[_ExpansionCandidate]:
+        """Given text from one company's corpus, return OTHER company/product names
+        mentioned in it (not already in the graph).
+
+        Substring validation: each returned evidence_quote MUST be a literal
+        substring of corpus_text. Same rule we use for edge extraction — the only
+        defence against hallucinated names.
+        """
+        if not corpus_text.strip():
+            return []
+
+        exclusion_list_str = ", ".join(sorted({e for e in exclusions if e})) or "(none)"
+        prompt = EXPANSION_PROMPT.format(
+            company=source_company,
+            exclusions=exclusion_list_str,
+            content=corpus_text[:12000],  # cap prompt size
+        )
+        try:
+            resp = await asyncio.to_thread(
+                self._client.models.generate_content,
+                model=MODEL_QUERY_PARSER,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.2,
+                    response_mime_type="application/json",
+                    response_schema=_ExpansionCandidateList,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                ),
+            )
+        except genai_errors.ClientError:
+            return []
+
+        parsed = _ExpansionCandidateList(**json.loads(resp.text))
+        haystack = corpus_text.lower()
+        exclusion_names = {e.lower().strip() for e in exclusions if e.strip()}
+        # Reject candidates whose homepage shares a root domain with the source —
+        # those are sub-products of the source company, not independent entities.
+        source_root = _root_domain_from_name(source_company, exclusions)
+
+        kept: list[_ExpansionCandidate] = []
+        seen_names: set[str] = set()
+        for c in parsed.candidates:
+            name_l = c.name.lower().strip()
+            if not name_l or name_l in seen_names:
+                continue
+            # Substring validation — same rule as edge extraction.
+            if c.evidence_quote.lower().strip() not in haystack:
+                continue
+            # Reject exclusions + generic terms.
+            if name_l in exclusion_names or name_l in GENERIC_EXCLUDES:
+                continue
+            # Reject short lowercase common words slipping through as proper nouns.
+            if (
+                name_l.isalpha()
+                and name_l == name_l.lower()
+                and " " not in name_l
+                and len(name_l) < 4
+            ):
+                continue
+            # Must have a usable, parseable homepage URL.
+            normalized_url = _normalize_url(c.homepage_url)
+            if not normalized_url:
+                continue
+            c = c.model_copy(update={"homepage_url": normalized_url})
+            # Reject sub-products: same root domain as the source.
+            candidate_root = _root_domain(normalized_url)
+            if candidate_root and source_root and candidate_root == source_root:
+                continue
+            kept.append(c)
+            seen_names.add(name_l)
+        return kept
+
     # ---- company summary ----
 
     async def summarize_company(self, *, company_name: str, content: str) -> str:
@@ -193,3 +326,52 @@ class GeminiClient:
         except genai_errors.ClientError:
             return ""
         return (resp.text or "").strip()
+
+
+def _normalize_url(url: str | None) -> str | None:
+    """Normalize a homepage URL: ensure scheme, strip whitespace, reject garbage."""
+    if not url:
+        return None
+    u = url.strip()
+    if not u:
+        return None
+    if not u.startswith(("http://", "https://")):
+        u = f"https://{u}"
+    try:
+        parsed = urlparse(u)
+    except ValueError:
+        return None
+    if not parsed.hostname or "." not in parsed.hostname:
+        return None
+    return u
+
+
+def _root_domain(url: str) -> str | None:
+    """Return the registrable-ish root of a URL: last 2 labels of the hostname.
+    Not a real public-suffix parse, but good enough to tell openai.com from
+    smith.openai.com or aws.amazon.com from amazon.com.
+    """
+    try:
+        host = urlparse(url).hostname
+    except ValueError:
+        return None
+    if not host:
+        return None
+    parts = host.split(".")
+    if len(parts) < 2:
+        return host
+    return ".".join(parts[-2:])
+
+
+def _root_domain_from_name(source_company: str, exclusions: list[str]) -> str | None:
+    """We only have the source_company name (e.g. "Langchain") here. Use the
+    exclusion list, which usually contains the source's domain, to find a root.
+    Fallback: derive from the company name alone (guess X.com).
+    """
+    for ex in exclusions:
+        if "." in ex:
+            # Looks like a domain.
+            root = _root_domain(f"https://{ex}")
+            if root:
+                return root
+    return None

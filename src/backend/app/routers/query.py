@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+from itertools import combinations
 from typing import AsyncIterator
 
 from fastapi import APIRouter, Query
@@ -22,7 +23,7 @@ from sse_starlette.sse import EventSourceResponse
 from app.clients.gemini import GeminiClient
 from app.clients.humandelta import HumanDeltaClient
 from app.models import IndexedCompany
-from app.services import temporal_store
+from app.services import edge_persist, temporal_store
 from app.services.extractor import EdgeFoundEvent, PairSkippedEvent, extract_graph
 from app.services.indexer import (
     IndexCompletedEvent,
@@ -107,34 +108,16 @@ async def _pipeline(query_text: str) -> AsyncIterator[dict]:
         name_to_domain: dict[str, str] = {c.name: c.domain for c in indexed}
         fresh_edge_keys_by_source: dict[str, set[tuple[str, str, str]]] = {}
         edge_count = 0
-        async for ev in extract_graph(hd, gemini, indexed):
+        pairs = list(combinations(indexed, 2))
+        async for ev in extract_graph(hd, gemini, pairs):
             if isinstance(ev, EdgeFoundEvent):
                 edge_count += 1
                 yield _sse("edge_found", ev.edge.model_dump())
-                # Persist. If the display-name → domain resolution fails for either
-                # endpoint, warn and skip — never write a row with a guessed domain.
-                src_dom = name_to_domain.get(ev.edge.source)
-                tgt_dom = name_to_domain.get(ev.edge.target)
-                if not src_dom or not tgt_dom:
-                    log.warning(
-                        "name→domain resolution failed for edge %s→%s; skipping persistence",
-                        ev.edge.source, ev.edge.target,
-                    )
-                    continue
-                version = version_by_domain.get(src_dom)
-                if version is None:
-                    log.warning(
-                        "no known crawl version for source domain %s; skipping persistence",
-                        src_dom,
-                    )
-                    continue
-                try:
-                    await temporal_store.upsert_edge(src_dom, tgt_dom, ev.edge, version)
-                except Exception:  # noqa: BLE001
-                    log.exception("upsert_edge failed for %s→%s", src_dom, tgt_dom)
-                    continue
-                fresh_edge_keys_by_source.setdefault(src_dom, set()).add(
-                    (src_dom, tgt_dom, ev.edge.type)
+                await edge_persist.persist_and_track(
+                    edge=ev.edge,
+                    name_to_domain=name_to_domain,
+                    version_by_domain=version_by_domain,
+                    fresh_edge_keys_by_source=fresh_edge_keys_by_source,
                 )
             elif isinstance(ev, PairSkippedEvent):
                 log.debug("pair skipped: %s + %s (%s)", ev.source, ev.target, ev.reason)
