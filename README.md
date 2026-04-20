@@ -1,4 +1,4 @@
-# Landscape
+# Fathom
 
 Turn any industry into a live, grounded knowledge graph. Type a query — "AI agent infrastructure companies" — and Landscape indexes each candidate company through Human Delta, extracts relationships from the indexed content via Gemini, and renders a force-directed Cytoscape graph where every edge is citable.
 
